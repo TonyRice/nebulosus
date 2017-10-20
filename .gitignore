@@ -1,0 +1,19 @@
+# Intellij
+.idea/*
+*.iml
+*.iws
+
+# Mac
+.DS_Store
+
+# Maven
+log/
+target/
+
+# ignore jar folder
+jar/*
+
+# ignore out folder
+out/*
+
+examples/src/Test.java
