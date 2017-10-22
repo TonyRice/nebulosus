@@ -17,3 +17,8 @@ jar/*
 out/*
 
 examples/src/Test.java
+
+# Tmp Files
+*.log
+*.json
+*.db
