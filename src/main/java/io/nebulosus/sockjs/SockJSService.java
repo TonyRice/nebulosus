@@ -55,14 +55,12 @@ public class SockJSService implements ClusterService {
 
         httpServer.setMaxWebSocketFrameSize(262144);
 
-        // Done with our exposing..
         httpServer.listen(serverPort, serverHost, asyncResult -> {
             if (!asyncResult.succeeded()) {
-                logger.fatal("Could not start Blahsdfasdfasdf on " + serverHost + ":" + serverPort);
+                logger.fatal("Could not start SockJSService on " + serverHost + ":" + serverPort);
                 return;
             }
-            logger.info("Blah blah Started on " + serverHost + ":" + serverPort);
-
+            logger.info("SockJSService Started on " + serverHost + ":" + serverPort);
         });
     }
 

@@ -34,9 +34,17 @@ public class SockJSHandler implements Handler<SockJSSocket> {
 
     @Override
     public void handle(final SockJSSocket sock) {
+
+        String remoteAddr = sock.remoteAddress().getAddress().getHostAddress();
+
+        String hostStr = remoteAddr + ":" + sock.remoteAddress().getPort();
+
+        logger.info("Handling new connection from \"" + hostStr + "\"");
+
         // After about 5 seconds we will disconnect if handshake has not been received.
         long sessionTimeout = localAsync.setTimer(5000, event -> {
              try {
+                 logger.warn("The connection at \"" + hostStr + "\" has timed out!");
                  sock.close();
                  clientSessions.remove(sock);
              } catch (Exception ignored){
@@ -45,13 +53,47 @@ public class SockJSHandler implements Handler<SockJSSocket> {
 
         sock.dataHandler(new Handler<Buffer>() {
 
-            //private void errorResponse();
+            private void handleEmptyCallback(Buffer buffer, int pos){
+                if(buffer.length() > pos + 4){
+                    int uuidLen = buffer.getInt(pos);
+                    pos += 4;
+
+                    if(buffer.length() >= pos + uuidLen){
+
+                        String callbackId = buffer.getString(pos, pos + uuidLen);
+
+                        Buffer replyCB = new Buffer();
+                        replyCB.appendByte((byte) 12);
+                        replyCB.appendInt(callbackId.length());
+                        replyCB.appendString(callbackId);
+
+                        sock.write(replyCB);
+                    }
+                }
+            }
+
+            private void sendError(){
+                sendError(null);
+            }
+
+            private void sendError(String error){
+                Buffer replyCB = new Buffer();
+                replyCB.appendByte((byte) 10); // protocol error.
+
+                if(error != null){
+                    int size = error.length();
+                    replyCB.appendInt(size);
+                    replyCB.appendString(error);
+                }
+
+                sock.write(replyCB);
+            }
 
             @Override
             public void handle(final Buffer buffer) {
 
+                // This tells os what we need to do.
                 final int cmd = buffer.getByte(0);
-
 
                 int pos = 1;
 
@@ -103,12 +145,15 @@ public class SockJSHandler implements Handler<SockJSSocket> {
 
                 // Looks like there's no session!
                 if(!clientSessions.containsKey(sock)){
+                    logger.warn("Session error from \"" + hostStr + "\"!");
+
                     sock.close();
                     return;
                 }
-                // Let's process commands here
 
-                if(cmd == 82){
+                // Let's process commands below
+                if(cmd == 81){
+                    // Remove
 
                     String key = null;
 
@@ -122,10 +167,31 @@ public class SockJSHandler implements Handler<SockJSSocket> {
                     }
 
                     if(key == null){
-                        // TODO
-                        // Respond with error.
-                        // Or maybe just disconnect since it's malformed data.
-                        sock.close();
+                        sendError();
+                        return;
+                    }
+
+                    nbdata.delete(key);
+
+                    handleEmptyCallback(buffer, pos);
+
+                } else if(cmd == 82){
+                    // Retrieve
+
+                    String key = null;
+
+                    byte keyType = buffer.getByte(pos);
+                    pos += 1;
+
+                    if(keyType == 97){
+                        int keySize = buffer.getInt(pos);
+                        pos += 4;
+                        key = buffer.getString(pos, keySize + pos);
+                        pos += keySize;
+                    }
+
+                    if(key == null){
+                        sendError();
                         return;
                     }
 
@@ -143,11 +209,11 @@ public class SockJSHandler implements Handler<SockJSSocket> {
                             Buffer replyCB = new Buffer();
                             replyCB.appendByte((byte) 13);
 
-                            String strData = data.toString();
-
-                            replyCB.appendInt(strData.length());
-
-                            replyCB.appendString(strData);
+                            if(data != null){
+                                String strData = data.toString();
+                                replyCB.appendInt(strData.length());
+                                replyCB.appendString(strData);
+                            }
 
                             replyCB.appendInt(callbackId.length());
                             replyCB.appendString(callbackId);
@@ -182,35 +248,14 @@ public class SockJSHandler implements Handler<SockJSSocket> {
                         pos += valSize;
                     }
 
-                    if(key == null || value == null){
-                        // TODO
-                        // Respond with error.
-                        // Or maybe just disconnect since it's malformed data.
-                        sock.close();
+                    if(key == null){
+                        sendError();
                         return;
                     }
 
                     nbdata.set(key, value);
 
-                    if(buffer.length() > pos + 4){
-                        int uuidLen = buffer.getInt(pos);
-                        pos += 4;
-
-                        if(buffer.length() >= pos + uuidLen){
-
-                            int finalPos = pos;
-                            localAsync.runOnContext(event -> {
-                                String callbackId = buffer.getString(finalPos, finalPos + uuidLen);
-
-                                Buffer replyCB = new Buffer();
-                                replyCB.appendByte((byte) 12);
-                                replyCB.appendInt(callbackId.length());
-                                replyCB.appendString(callbackId);
-
-                                sock.write(replyCB);
-                            });
-                        }
-                    }
+                    handleEmptyCallback(buffer, pos);
                 }
             }
         });
@@ -218,6 +263,8 @@ public class SockJSHandler implements Handler<SockJSSocket> {
         sock.endHandler(event -> {
             localAsync.cancelTimer(sessionTimeout);
             clientSessions.remove(sock);
+
+            logger.warn("The connection at \"" + hostStr + "\" has disconnected.");
         });
     }
 }
