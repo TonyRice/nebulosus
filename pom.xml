@@ -6,7 +6,7 @@
 
     <groupId>io.nebulosus</groupId>
     <artifactId>nebulosus</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>0.0.1</version>
 
     <name>Nebulosus</name>
     <description>Nebulosus is a distributed key-value store.</description>
