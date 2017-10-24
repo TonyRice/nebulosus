@@ -46,9 +46,6 @@ import java.security.spec.KeySpec;
 import java.util.*;
 import java.util.concurrent.*;
 
-// TODO develop pinning nodes. These nodes exist soley for the purpose of pinning data
-// TODO allow multiple maps.
-
 /**
  * The IPFSCryptoPersistor provides a powerful persistence layer to Hazelcast. This gives the system the ability
  * to persist data in a way that ensures it's longevity no matter what happens to a single node.
@@ -294,8 +291,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
                 // Let's save the initial key table.
                 saveKeyTable(true, event -> {
 
-                    //  TODO let's set a timer to check for the last update
-
                     // TODO improve detection of
                     // changes. This code below will not persist small updates
                     // immediately.
@@ -307,11 +302,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
                         @Override
                         public void handle(Long event) {
                             if(isMaster() && !inUpdate){
-                                // TODO check for the last key update
-                                // we will use this to check to see how much time has passed
-                                //
-
-                                // TODO verify this stuff
 
                                 boolean shouldUpdate = checkCount >= 50 && keyUpdateCount > 1 || keyUpdateCount > 100 * 1000;
                                 if(lastKeyUpdateTime != null){
@@ -950,7 +940,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
         // Not sure if this is too safe :D
         NamedStreamable.ByteArrayWrapper encIpfsData = new NamedStreamable.ByteArrayWrapper(name, data);
         List<MerkleNode> addResult;
-        // TODO autodetect pinning..
+        // TODO autodetect pinning
         IPFS ipfs = ipfsClientPool.get();
         try {
             addResult = ipfs.add(encIpfsData, save);
