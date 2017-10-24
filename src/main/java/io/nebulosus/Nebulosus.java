@@ -4,21 +4,17 @@ import com.hazelcast.config.EvictionPolicy;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
-import com.hazelcast.core.IMap;
-import com.hazelcast.core.MapLoader;
 import com.hazelcast.core.MapStoreFactory;
 import com.hazelcast.map.merge.LatestUpdateMapMergePolicy;
 import io.jsync.app.ClusterApp;
 import io.jsync.app.core.Cluster;
 import io.jsync.app.core.Config;
-import io.jsync.app.core.Logger;
-import io.jsync.app.core.service.ClusterService;
 import io.jsync.json.JsonObject;
 import io.nebulosus.persistence.DummyDataPersistor;
 import io.nebulosus.ipfs.IPFSCryptoPersistor;
+import io.nebulosus.persistence.NBDataPreloadService;
 import io.nebulosus.sockjs.SockJSService;
 
-import java.util.Properties;
 
 
 public class Nebulosus extends ClusterApp {
@@ -69,45 +65,10 @@ public class Nebulosus extends ClusterApp {
         // Let's add a hook to tell jsync.io to update the hazelcast config
         cluster.manager().addConfigHandler(hazelcastConfig -> hazelcastConfig.addMapConfig(nbDataMapConfig));
 
-        Logger logger = cluster().logger();
-
+        cluster.addService(new NBDataPreloadService());
         cluster.addService(new SockJSService());
 
-        cluster.addService(new ClusterService() {
-
-            private boolean started = false;
-
-            @Override
-            public void start(Cluster owner) {
-                started = true;
-
-                logger.info("Ensuring the map \"nbdata\" can be preloaded.");
-
-                // This represents the data we store in this nebulosus keyvalue store
-                IMap<String, String> nbdata = owner.data().getMap("nbdata",false);
-
-                logger.info("Finished loading the map \"nbdata\" with " + nbdata.size() + " keys.");
-
-            }
-
-            @Override
-            public void stop() {
-
-            }
-
-            @Override
-            public boolean running() {
-                return started;
-            }
-
-            @Override
-            public String name() {
-                return "PreLoadService";
-            }
-        });
-
     }
-
 
     public static void main(String[] args){
         Nebulosus nebulosus = new Nebulosus();
