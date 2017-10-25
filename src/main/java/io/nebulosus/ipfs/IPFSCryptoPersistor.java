@@ -418,10 +418,16 @@ public class IPFSCryptoPersistor implements DataPersistor {
         readyHandlers.add(handler);
     }
 
+    /**
+     * @return returns true if the cluster is ready
+     */
     private boolean isReady(){
         return localAsync != null && keyTableCache != null && valueTableCache != null;
     }
 
+    /**
+     * @return returns true if we are the only or first node in the cluster.
+     */
     private boolean isMaster() {
         try {
             Set<Member> members = hazelcast.getCluster().getMembers();
@@ -433,6 +439,9 @@ public class IPFSCryptoPersistor implements DataPersistor {
         return false;
     }
 
+    /**
+     * This will load all the data that is stored within Nebulosus.
+     */
     private void loadKeyTable() {
 
         long startTime = System.nanoTime();
