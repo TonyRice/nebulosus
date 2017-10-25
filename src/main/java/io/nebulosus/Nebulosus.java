@@ -55,7 +55,7 @@ public class Nebulosus extends ClusterApp {
         mapStoreConfig.setWriteDelaySeconds(0);
         mapStoreConfig.setEnabled(true);
 
-        mapStoreConfig.setFactoryImplementation((MapStoreFactory) (s, properties) -> new IPFSCryptoPersistor());
+        mapStoreConfig.setFactoryImplementation((MapStoreFactory) (mapName, properties) -> new IPFSCryptoPersistor());
 
         // -- IMPORTANT --
         // We must create a map config for all data that we want to be persistent outside
