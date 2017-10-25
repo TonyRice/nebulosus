@@ -40,7 +40,6 @@ import java.security.AlgorithmParameters;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
-import java.security.spec.InvalidKeySpecException;
 import java.security.spec.InvalidParameterSpecException;
 import java.security.spec.KeySpec;
 import java.util.*;
@@ -51,6 +50,11 @@ import java.util.concurrent.*;
  * to persist data in a way that ensures it's longevity no matter what happens to a single node.
  */
 public class IPFSCryptoPersistor implements DataPersistor {
+
+    final public static String DEFAULT_RANDOM = "SHA1PRNG";
+    final public static String DEFAULT_SECRET_KEY_SPEC = "AES";
+    final public static String DEFAULT_KEY_FACTORY = "PBKDF2WithHmacSHA512";
+    final public static String DEFAULT_CIPHER = "AES/CBC/PKCS5Padding";
 
     private Cluster cluster = null;
     private HazelcastInstance hazelcast = null;
@@ -82,6 +86,8 @@ public class IPFSCryptoPersistor implements DataPersistor {
     private Date lastKeyUpdateTime = null;
     private int keyUpdateCount = 0;
 
+    private Set<Handler<Void>> readyHandlers = new LinkedHashSet<>();
+
     private boolean initialized = false;
 
     @Override
@@ -91,22 +97,15 @@ public class IPFSCryptoPersistor implements DataPersistor {
             throw new RuntimeException("This has already been initialized!");
         }
 
-        initialized = true;
-
-        logger.info("Initializing the IPFSCryptoPersistor on the map \"" + mapName + "\".");
-
         ClusterApp current = ClusterApp.activeInstance();
 
         cluster = current.cluster();
-        hazelcast = cluster.hazelcast();
+        hazelcast = hazelcastInstance;
         classLoader = current.getClass().getClassLoader();
 
-        // this map exists to provide shared data between each nodes. This is generally used
-        // to store temporary data in memory.
-        sharedData = current.cluster().data().getMap("p.n.s", false);
+        initialized = true;
 
-        localAsync = current.cluster().localAsync();
-        eventBus = current.cluster().eventBus();
+        logger.info("Initializing the IPFSCryptoPersistor on the map \"" + mapName + "\".");
 
         ipfsClientPool = new IPFSClientPool(IPFSClientPool.DEFAULT_ADDRESS);
 
@@ -128,8 +127,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
         ipfsConfig.putString("store", store);
         ipfsConfig.putString("pass", storePass);
 
-        // This is how we are going to encrypt data.
-        cryptoPass = CryptoUtils.calculateHmacSHA512(store + storePass, storePass + store);
+        sharedData = hazelcast.getMap("shared");
 
         logger.info("Verifying connection to IPFS.");
 
@@ -145,11 +143,11 @@ public class IPFSCryptoPersistor implements DataPersistor {
             // Begin SecretKey generation
             SecretKey secret;
 
-            SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA512");
+            SecretKeyFactory factory = SecretKeyFactory.getInstance(DEFAULT_KEY_FACTORY);
 
             if (saltData.isEmpty()) {
 
-                SecureRandom sr = SecureRandom.getInstance("SHA1PRNG");
+                SecureRandom sr = SecureRandom.getInstance(DEFAULT_RANDOM);
                 byte[] salt = new byte[16];
                 sr.nextBytes(salt);
 
@@ -159,14 +157,14 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                 KeySpec spec = new PBEKeySpec(cryptoPass.toCharArray(), salt, 65536, 128);
                 SecretKey tmp = factory.generateSecret(spec);
-                secret = new SecretKeySpec(tmp.getEncoded(), "AES");
+                secret = new SecretKeySpec(tmp.getEncoded(), DEFAULT_SECRET_KEY_SPEC);
 
             } else {
                 Multihash saltPointer = Multihash.fromBase58(saltData);
                 byte[] salt = ipfs.cat(saltPointer);
                 KeySpec spec = new PBEKeySpec(cryptoPass.toCharArray(), salt, 65536, 128);
                 SecretKey tmp = factory.generateSecret(spec);
-                secret = new SecretKeySpec(tmp.getEncoded(), "AES");
+                secret = new SecretKeySpec(tmp.getEncoded(), DEFAULT_SECRET_KEY_SPEC);
             }
 
             secretKey = secret;
@@ -183,170 +181,252 @@ public class IPFSCryptoPersistor implements DataPersistor {
             mapHash = CryptoUtils.calculateSHA1(mapName.getBytes());
 
             Config finalConfig = config;
-            // This is where we will receive KeyTable events
 
-            eventBus.registerHandler("kt.event." + mapHash, (Handler<Message<Buffer>>) event -> {
-                localAsync.executeBlocking(() -> {
+            Handler<Void> finishStartup = ignored -> {
 
-                    // Let's get the actual message.
-                    return decryptMessageData(event.body());
+                localAsync = current.cluster().localAsync();
+                eventBus = current.cluster().eventBus();
 
-                }, event1 -> {
-                    Buffer evtBuffer = event1.result();
+                // This is where we will receive KeyTable events
 
-                    int evtType = evtBuffer.getInt(0);
+                eventBus.registerHandler("nb.event." + mapHash, (Handler<Message<Buffer>>) event -> {
 
-                    int nodeLen = evtBuffer.getInt(4);
+                    localAsync.executeBlocking(() -> {
 
-                    String nodeId = evtBuffer.getString(8, nodeLen + 8);
+                        // Let's get the actual message.
+                        return decryptMessageData(event.body());
 
-                    // Unless it is event type 75 which will simply
-                    // save the latest key index to our configuration.
-                    if (nodeId.equals(cluster.manager().nodeId()) && evtType != 75 && evtType != 70) {
-                        return; // We do not need to do anything at all.
-                    }
+                    }, event1 -> {
+                        Buffer evtBuffer = event1.result();
 
-                    // This means we are receiving the latest
-                    // data for a key.
-                    if (evtType == 65) {
+                        int pos = 0;
 
-                        // Key Update - 65
-                        int keyLen = evtBuffer.getInt(nodeLen + 8);
-                        String key = evtBuffer.getString(nodeLen + 12, nodeLen + keyLen + 12);
+                        int evtType = evtBuffer.getInt(pos);
+                        pos += 4;
 
-                        int blobLen = evtBuffer.getInt(nodeLen + keyLen + 12);
+                        int nodeLen = evtBuffer.getInt(pos);
+                        pos += 4;
 
-                        byte[] cryptoBlobData = evtBuffer.getBytes(nodeLen + keyLen + 12, nodeLen + blobLen + keyLen + 12);
+                        String nodeId = evtBuffer.getString(pos, nodeLen + pos);
+                        pos += nodeLen;
 
-                        storeLocally(key, cryptoBlobData);
-
-                    } else if (evtType == 70) {
-
-                        // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
-                        // We initializing the database it will load all thy keys..
-                        String vtIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\\n", "");
-
-                        String previous = ipfsConfig.getString("vt_index", "");
-
-                        if (!previous.isEmpty()) {
-                            logger.info("Replacing previous vt index \"" + previous + "\" with \"" + vtIndex + "\".");
+                        // Unless it is event type 75 which will simply
+                        // save the latest key index to our configuration.
+                        if (nodeId.equals(cluster.manager().nodeId()) && evtType != 75 && evtType != 70) {
+                            return; // We do not need to do anything at all.
                         }
 
-                        ipfsConfig.putString("vt_index", vtIndex);
+                        // This means we are receiving the latest
+                        // data for a key.
+                        if (evtType == 65) {
 
-                        // Let's make sure we save the config
-                        clusterConfig.putObject("ipfs", ipfsConfig);
+                            int keyLen = evtBuffer.getInt(pos);
+                            pos += 4;
 
-                        finalConfig.rawConfig().putObject("cluster", clusterConfig);
-                        finalConfig.save();
+                            String key = evtBuffer.getString(pos, pos + keyLen);
 
-                        logger.info("Saved latest vt index.");
+                            pos += keyLen;
 
-                        this.valueTableIndex = vtIndex;
+                            long blobLen = evtBuffer.getLong(pos);
+                            pos += 8;
 
-                    } else if (evtType == 75) {
+                            byte[] cryptoBlobData = evtBuffer.getBytes(pos, Math.toIntExact(pos + blobLen));
 
-                        // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
-                        // We initializing the database it will load all thy keys..
-                        String ktIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\n", "");
+                            // Let's ensure we also store the data locally
+                            storeLocally(key, cryptoBlobData);
 
-                        String previous = ipfsConfig.getString("kt_index", "");
+                        } else if (evtType == 70) {
 
-                        if (!previous.isEmpty()) {
-                            logger.info("Replacing previous key-table index \"" + previous + "\" with \"" + ktIndex + "\".");
+                            // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
+                            // We initializing the database it will load all thy keys..
+                            String vtIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\\n", "");
+
+                            String previous = ipfsConfig.getString("vt_index", "");
+
+                            if (!previous.isEmpty()) {
+                                logger.info("Replacing previous vt index \"" + previous + "\" with \"" + vtIndex + "\".");
+                            }
+
+                            ipfsConfig.putString("vt_index", vtIndex);
+
+                            // Let's make sure we save the config
+                            clusterConfig.putObject("ipfs", ipfsConfig);
+
+                            finalConfig.rawConfig().putObject("cluster", clusterConfig);
+                            finalConfig.save();
+
+                            logger.info("Saved latest vt index.");
+
+                            valueTableIndex = vtIndex;
+
+                        } else if (evtType == 75) {
+
+                            // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
+                            // We initializing the database it will load all thy keys..
+                            String ktIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\n", "");
+
+                            String previous = ipfsConfig.getString("kt_index", "");
+
+                            if (!previous.isEmpty()) {
+                                logger.info("Replacing previous key-table index \"" + previous + "\" with \"" + ktIndex + "\".");
+                            }
+
+                            ipfsConfig.putString("kt_index", ktIndex);
+
+                            // Let's make sure we save the config
+                            clusterConfig.putObject("ipfs", ipfsConfig);
+
+                            finalConfig.rawConfig().putObject("cluster", clusterConfig);
+                            finalConfig.save();
+
+                            logger.info("Saved latest key table index.");
+
+                            keyTableIndex = ktIndex;
+
                         }
-
-                        ipfsConfig.putString("kt_index", ktIndex);
-
-                        // Let's make sure we save the config
-                        clusterConfig.putObject("ipfs", ipfsConfig);
-
-                        finalConfig.rawConfig().putObject("cluster", clusterConfig);
-                        finalConfig.save();
-
-                        logger.info("Saved latest key table index.");
-
-                        this.keyTableIndex = ktIndex;
-
-                    }
+                    });
                 });
-            });
 
-            this.keyTableIndex = ipfsConfig.getString("kt_index", "");
-
-            if(isMaster()){
+                keyTableIndex = ipfsConfig.getString("kt_index", "");
 
                 loadKeyTable();
 
-                // By default every 24 hours we will save a snapshot of the "Database"
-                localAsync.setPeriodic(TimeUnit.HOURS.toMillis(24), event -> {
-                    saveValueTableCache(new Handler<AsyncResult<Void>>() {
+                if(isMaster()){
+
+                    // Since we are the master. We shall listen for new members
+                    hazelcastInstance.getCluster().addMembershipListener(new MembershipListener() {
                         @Override
-                        public void handle(AsyncResult<Void> event) {
-                            saveKeyTable(false);
+                        public void memberAdded(MembershipEvent membershipEvent) {
+                            Buffer newIndexValues = new Buffer();
+                            newIndexValues.appendInt(keyTableIndex.length());
+                            newIndexValues.appendString(keyTableIndex);
+                            newIndexValues.appendInt(valueTableIndex.length());
+                            newIndexValues.appendString(valueTableIndex);
+
+                            String memberId = membershipEvent.getMember().getUuid();
+
+                            sharedData.put("indexs_" + memberId, newIndexValues.getBytes(), 10, TimeUnit.MINUTES);
+
+                            logger.info("Published latest index values for the member \"" + memberId + "\".");
+                        }
+
+                        @Override
+                        public void memberRemoved(MembershipEvent membershipEvent) {
+
+                        }
+
+                        @Override
+                        public void memberAttributeChanged(MemberAttributeEvent memberAttributeEvent) {
+
                         }
                     });
-                });
 
-                // Let's save the initial key table.
-                saveKeyTable(true, event -> {
+                    // By default every 24 hours we will save a snapshot of the "Database"
+                    localAsync.setPeriodic(TimeUnit.HOURS.toMillis(24), event -> {
+                        saveValueTableCache(event13 -> saveKeyTableCache(false));
+                    });
 
-                    // TODO improve detection of
-                    // changes. This code below will not persist small updates
-                    // immediately.
-                    localAsync.setPeriodic(5000, new Handler<Long>() {
+                    // Let's save the initial key table.
+                    saveKeyTableCache(true, event -> {
 
-                        private int checkCount = 0;
-                        private boolean inUpdate = false;
+                        localAsync.setPeriodic(5000, new Handler<Long>() {
 
-                        @Override
-                        public void handle(Long event) {
-                            if(isMaster() && !inUpdate){
+                            private int checkCount = 0;
+                            private boolean inUpdate = false;
 
-                                boolean shouldUpdate = checkCount >= 50 && keyUpdateCount > 1 || keyUpdateCount > 100 * 1000;
-                                if(lastKeyUpdateTime != null){
+                            @Override
+                            public void handle(Long event) {
+                                if(isMaster() && !inUpdate){
 
-                                    Date curDate = new Date();
-                                    int difference = (int) (curDate.getTime() - lastKeyUpdateTime.getTime())/1000;
+                                    boolean shouldUpdate = checkCount >= 50 && keyUpdateCount > 1 || keyUpdateCount > 100 * 1000;
+                                    if(lastKeyUpdateTime != null){
 
-                                    // TODO - Let's make this number configurable.
-                                    if(difference >= 60){
+                                        Date curDate = new Date();
+                                        int difference = (int) (curDate.getTime() - lastKeyUpdateTime.getTime())/1000;
 
-                                        logger.info("It has been " + difference + " seconds since the last key table update.");
-
-                                        lastKeyUpdateTime = null;
-                                        shouldUpdate = true;
+                                        // et's make this number configurable in the future
+                                        if(difference >= 60){
+                                            logger.info("It has been " + difference + " seconds since the last key table update.");
+                                            lastKeyUpdateTime = null;
+                                            shouldUpdate = true;
+                                        }
                                     }
-                                }
 
-                                if(shouldUpdate){
-                                    inUpdate = true;
-                                    saveKeyTable(true, event12 -> {
-                                        inUpdate = false;
-                                        checkCount = 0;
-                                        keyUpdateCount = 0;
-                                    });
+                                    if(shouldUpdate){
+                                        inUpdate = true;
+                                        saveKeyTableCache(true, event12 -> {
+                                            inUpdate = false;
+                                            checkCount = 0;
+                                            keyUpdateCount = 0;
+                                        });
+                                    }
+                                    checkCount++;
                                 }
-                                checkCount++;
                             }
-                        }
+                        });
                     });
+                }
+
+                for (Handler<Void> readyHandler : readyHandlers) {
+                    localAsync.runOnContext(readyHandler);
+                }
+
+                readyHandlers.clear();
+            };
+
+            if(!isMaster()){
+                // every 3.5 seconds let's check if the cluster is safe..
+                current.cluster().localAsync().setPeriodic(3500, event -> {
+                    // This basically tells the cluster
+                    if(!hazelcast.getPartitionService().isClusterSafe()){
+                        logger.info("Cluster is not safe... not loading yet..");
+                        return;
+                    }
+                    try {
+                        cluster.async();
+                    } catch (Exception ignored){
+                        logger.info("Cluster is not safe... not loading yet..");
+                        return;
+                    }
+                    current.cluster().localAsync().cancelTimer(event);
+                    finishStartup.handle(null);
                 });
+
+            } else {
+                finishStartup.handle(null);
             }
 
-        } catch (NoSuchAlgorithmException | InvalidKeySpecException | IOException e) {
+
+
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         } finally {
             ipfsClientPool.release(ipfs);
         }
+    }
 
+    /**
+     * This is used to execute any handlers as soon as the cluster is ready.
+     *
+     * @param handler the handler you wish to execute
+     */
+    private void onReady(Handler<Void> handler){
+        if(isReady()){
+            handler.handle(null);
+            return;
+        }
+        readyHandlers.add(handler);
+    }
+
+    private boolean isReady(){
+        return localAsync != null && keyTableCache != null && valueTableCache != null;
     }
 
     private boolean isMaster() {
         try {
-
-            Set<Member> members = cluster.hazelcast().getCluster().getMembers();
+            Set<Member> members = hazelcast.getCluster().getMembers();
             // There's only one node.. so yeah.
-            return members.size() == 1 || !members.isEmpty() && members.iterator().next() == cluster.hazelcast().getCluster().getLocalMember();
+            return members.size() == 1 || !members.isEmpty() && members.iterator().next() == hazelcast.getCluster().getLocalMember();
         } catch (Exception e){
             e.printStackTrace();
         }
@@ -354,7 +434,39 @@ public class IPFSCryptoPersistor implements DataPersistor {
     }
 
     private void loadKeyTable() {
+
         long startTime = System.nanoTime();
+
+        boolean forceUpdate = false;
+
+        if(!isMaster()){
+            String memberId = hazelcast.getCluster().getLocalMember().getUuid();
+
+            Buffer indexData = new Buffer((byte[]) sharedData.get("indexs_" + memberId));
+
+            int pos = 0;
+
+            int ktIndexLen = indexData.getInt(pos);
+            pos += 4;
+
+            String ktIndex = indexData.getString(pos, pos + ktIndexLen);
+            pos += ktIndexLen;
+
+            int vtIndexLen = indexData.getInt(pos);
+            pos += 4;
+
+            String vtIndex = indexData.getString(pos, pos + vtIndexLen);
+
+            if(!ktIndex.equals(keyTableIndex)){
+                keyTableIndex = ktIndex;
+            }
+
+            if(!vtIndex.equals(valueTableIndex)){
+                valueTableIndex = ktIndex;
+            }
+
+            forceUpdate = true;
+        }
 
         String keyTableCacheFile = "ktcache.db";
         String valueTableCacheFile = "vtcache.db";
@@ -391,7 +503,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                 logger.info("Searching for \"" + keyTableCacheFile + "\"...");
 
-                if(!Files.exists(Paths.get(keyTableCacheFile))){
+                if(!Files.exists(Paths.get(keyTableCacheFile)) || forceUpdate){
                     // Looks like this file does not exist.
                     logger.info("\"" + keyTableCacheFile + "\" was not found. Restoring from \"" + keyTableIndex + "\".");
 
@@ -399,6 +511,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                     try {
                         Files.write(Paths.get(keyTableCacheFile), decryptedCryptoBlob.getBytes());
                     } catch (IOException e) {
+                        e.printStackTrace();
                         throw new RuntimeException("Error restoring \"" + valueTableCacheFile + "\" from \"" + keyTableIndex + "\".", e);
                     }
                 }
@@ -419,7 +532,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                 logger.info("Searching for \"" + valueTableCacheFile + "\"...");
 
-                if(!Files.exists(Paths.get(valueTableCacheFile))){
+                if(!Files.exists(Paths.get(valueTableCacheFile)) || forceUpdate){
                     // Looks like this file does not exist.
                     logger.info("\"" + valueTableCacheFile + "\" was not found. Restoring from \"" + vtIndex + "\".");
 
@@ -452,19 +565,19 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
     }
 
-    public void saveKeyTable(){
-        saveKeyTable(true, null);
+    public void saveKeyTableCache(){
+        saveKeyTableCache(true, null);
     }
 
-    public void saveKeyTable(boolean saveLocalCache){
-        saveKeyTable(saveLocalCache, null);
+    public void saveKeyTableCache(boolean saveLocalCache){
+        saveKeyTableCache(saveLocalCache, null);
     }
 
-    public void saveKeyTable(Handler<AsyncResult<Void>> asyncResultHandler) {
-        saveKeyTable(true, asyncResultHandler);
+    public void saveKeyTableCache(Handler<AsyncResult<Void>> asyncResultHandler) {
+        saveKeyTableCache(true, asyncResultHandler);
     }
 
-    public void saveKeyTable(boolean saveLocalCache, Handler<AsyncResult<Void>> asyncResultHandler) {
+    public void saveKeyTableCache(boolean saveLocalCache, Handler<AsyncResult<Void>> asyncResultHandler) {
         if(asyncResultHandler == null){
             asyncResultHandler = event -> { };
         }
@@ -474,23 +587,24 @@ public class IPFSCryptoPersistor implements DataPersistor {
         if (isMaster()) {
             localAsync.runOnContext(ignoreThis -> {
                 if (saveLocalCache) {
-                    logger.info("Saving the local value cache first...");
                     saveValueTableCache(event -> {
                         if (event.failed()) {
                             resultHandler.handle(event);
                             return;
                         }
-                        saveKeyTableCache(resultHandler);
+                        _saveKeyTableCache(resultHandler);
                     });
                     return;
                 }
 
-                saveKeyTableCache(resultHandler);
+                _saveKeyTableCache(resultHandler);
             });
+            return;
         }
+        resultHandler.handle(new DefaultFutureResult<>(new Exception("It looks like the key table could not be saved since you are not the master node.")));
     }
 
-    private void saveKeyTableCache(Handler<AsyncResult<Void>> asyncResultHandler) {
+    private void _saveKeyTableCache(Handler<AsyncResult<Void>> asyncResultHandler) {
 
         if(asyncResultHandler == null){
             asyncResultHandler = event -> {};
@@ -499,7 +613,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
         final Handler<AsyncResult<Void>> resultHandler = asyncResultHandler;
 
         if (isMaster()) {
-
             localAsync.runOnContext(ignoreThis -> {
 
                 ILock lock = hazelcast.getLock("kt.update." + mapHash);
@@ -605,7 +718,9 @@ public class IPFSCryptoPersistor implements DataPersistor {
                     return null;
                 }, (Handler<AsyncResult<Void>>) event -> syncMaster.handle(null));
             });
+            return;
         }
+        resultHandler.handle(new DefaultFutureResult<>(new Exception("It looks like the value table could not be saved since you are not the master node.")));
     }
 
     private void saveValueTableCache(Handler<AsyncResult<Void>> asyncResultHandler) {
@@ -724,9 +839,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
             });
         }
     }
-    
-    
-    
 
     private Buffer decryptCryptoBlob(byte[] data){
         return decryptCryptoBlob(new Buffer(data));
@@ -779,14 +891,13 @@ public class IPFSCryptoPersistor implements DataPersistor {
             }
         }
 
-
         int ivHashLen = cryptoBlob.getInt(pos);
         pos += 4;
         byte[] iv = cryptoBlob.getBytes(pos, ivHashLen + pos);
 
         try {
 
-            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
             IvParameterSpec ivParameterSpec = new IvParameterSpec(iv);
             cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec);
 
@@ -812,7 +923,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
         try {
 
-            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
             cipher.init(Cipher.ENCRYPT_MODE, secretKey);
             AlgorithmParameters params = cipher.getParameters();
 
@@ -834,14 +945,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                 newData.appendInt(hash.length());
                 newData.appendString(hash);
-
-                /*
-                // This may be really resource intensive.
-                String dataHash = CryptoUtils.calculateSHA1(dataToEnc);
-
-                // This may never be useful.
-                newData.appendInt(dataHash.length());
-                newData.appendString(dataHash);*/
 
             } else {
 
@@ -872,24 +975,23 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
             // We need to retrieve the iv from Hazelcast.
             // We can also remove it too.
-            byte[] iv = (byte[]) sharedData.remove(ivHash);
+            byte[] iv = (byte[]) sharedData.get(ivHash);
 
             byte[] encrypted = data.getBytes(ivHashLen + 8, dataLen + ivHashLen + 8);
 
-            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
             IvParameterSpec ivParameterSpec = new IvParameterSpec(iv);
             cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec);
 
             return new Buffer(cipher.doFinal(encrypted));
         } catch (Exception e) {
             throw new RuntimeException(e);
-
         }
     }
 
     private Buffer encryptMessageData(Buffer data) {
         try {
-            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
             cipher.init(Cipher.ENCRYPT_MODE, secretKey);
             AlgorithmParameters params = cipher.getParameters();
 
@@ -903,7 +1005,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
             String ivHash = CryptoUtils.calculateSHA1(iv);
 
             // We need to store this here
-            sharedData.put(ivHash, iv);
+            sharedData.put(ivHash, iv, 15, TimeUnit.MINUTES);
 
             newData.appendInt(ivHash.length());
             newData.appendString(ivHash);
@@ -933,7 +1035,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
             evt.appendBuffer(evtData);
 
             return encryptMessageData(evt);
-        }, event -> eventBus.publish("kt.event." + mapHash, event.result()));
+        }, event -> eventBus.publish("nb.event." + mapHash, event.result()));
     }
 
     private String storeIpfsData(String name, byte[] data, boolean save) {
@@ -1062,16 +1164,25 @@ public class IPFSCryptoPersistor implements DataPersistor {
             }
         }
 
-        localAsync.executeBlocking(() -> createCryptoBlob(dataBuffer), event -> {
+        onReady(ignored -> localAsync.executeBlocking(() -> createCryptoBlob(dataBuffer), event -> {
 
             Buffer cryptoBlob = event.result();
 
             String nKey = key.toString();
 
-            publishEvent(65, cryptoBlob);
+            Buffer storeEvent = new Buffer();
+
+            storeEvent.appendInt(nKey.length());
+            storeEvent.appendString(nKey);
+
+            storeEvent.appendLong(cryptoBlob.length());
+
+            storeEvent.appendBuffer(cryptoBlob);
+
+            publishEvent(65, storeEvent);
 
             storeLocally(nKey, cryptoBlob.getBytes());
-        });
+        }));
     }
 
     @Override
@@ -1081,7 +1192,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
     @Override
     public void delete(Object key) {
-        localAsync.runOnContext(event -> {
+        onReady(ignored -> localAsync.runOnContext(event -> {
             String sKey = key.toString();
             String keyHash = CryptoUtils.calculateSHA1(sKey.getBytes());
 
@@ -1090,7 +1201,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
             keyUpdateCount++;
             lastKeyUpdateTime = new Date();
-        });
+        }));
     }
 
     @Override
@@ -1100,68 +1211,70 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
     @Override
     public Object load(Object o) {
-        try {
-            if (keyTableCache.containsKey(o)) {
+        if(isReady()){
+            try {
+                if (keyTableCache.containsKey(o)) {
 
-                // Let's retrieve the data automatically.
-                Buffer dataBuff = decryptCryptoBlob((byte[]) keyTableCache.get(o));
+                    // Let's retrieve the data automatically.
+                    Buffer dataBuff = decryptCryptoBlob((byte[]) keyTableCache.get(o));
 
-                int dataType = dataBuff.getInt(0);
-                if (dataType == 1) {
-                    return dataBuff.getString(8, dataBuff.getInt(4) + 8);
-                } else if (dataType == 2) {
-                    return dataBuff.getLong(4);
-                } else if (dataType == 3) {
-                    return dataBuff.getInt(4);
-                } else if (dataType == 4) {
-                    return dataBuff.getFloat(4);
-                } else if (dataType == 5) {
+                    int dataType = dataBuff.getInt(0);
+                    if (dataType == 1) {
+                        return dataBuff.getString(8, dataBuff.getInt(4) + 8);
+                    } else if (dataType == 2) {
+                        return dataBuff.getLong(4);
+                    } else if (dataType == 3) {
+                        return dataBuff.getInt(4);
+                    } else if (dataType == 4) {
+                        return dataBuff.getFloat(4);
+                    } else if (dataType == 5) {
 
-                    int classLen = dataBuff.getInt(4);
-                    String className = dataBuff.getString(8, classLen + 8);
+                        int classLen = dataBuff.getInt(4);
+                        String className = dataBuff.getString(8, classLen + 8);
 
-                    int dataLen = dataBuff.getInt(classLen + 8);
-                    byte[] datas = dataBuff.getBytes(classLen + 12, classLen + dataLen + 12);
+                        int dataLen = dataBuff.getInt(classLen + 8);
+                        byte[] datas = dataBuff.getBytes(classLen + 12, classLen + dataLen + 12);
 
-                    JsonObject json = new JsonObject(new String(datas));
+                        JsonObject json = new JsonObject(new String(datas));
 
-                    Class clazz = null; //cachedClasses.get(className);
-                    if (clazz == null) {
-                        clazz = classLoader.loadClass(className);
-                        // We want to ensure that we store the new class inside the cache?
-                        // The cache doesn't really expire because classes using this
-                        // classloader should not dynamically change
-                        //if (clazz != null) cachedClasses.put(className, clazz);
-                    }
-                    if (clazz != null) {
-                        if (DataType.class.isAssignableFrom(clazz)) {
-                            Method method = clazz.getMethod("loadJson", JsonObject.class);
-                            Object newInstance = clazz.newInstance();
-                            method.invoke(newInstance, json);
-                            return newInstance;
-                        } else if (IdentifiedDataType.class.isAssignableFrom(clazz)) {
-                            Method method = clazz.getMethod("loadJson", JsonObject.class);
-                            Object newInstance = clazz.newInstance();
-                            method.invoke(newInstance, json);
-                            return newInstance;
+                        Class clazz = null; //cachedClasses.get(className);
+                        if (clazz == null) {
+                            clazz = classLoader.loadClass(className);
+                            // We want to ensure that we store the new class inside the cache?
+                            // The cache doesn't really expire because classes using this
+                            // classloader should not dynamically change
+                            //if (clazz != null) cachedClasses.put(className, clazz);
                         }
-                    }
-
-                } else if (dataType == 7) {
-                    int dataLen = dataBuff.getInt(4);
-                    InputStream buffer = new ByteArrayInputStream(dataBuff.getBytes(8, dataLen + 8));
-                    ObjectInput input = new ObjectInputStream(buffer) {
-                        @Override
-                        protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException,
-                                ClassNotFoundException {
-                            return classLoader.loadClass(desc.getName());
+                        if (clazz != null) {
+                            if (DataType.class.isAssignableFrom(clazz)) {
+                                Method method = clazz.getMethod("loadJson", JsonObject.class);
+                                Object newInstance = clazz.newInstance();
+                                method.invoke(newInstance, json);
+                                return newInstance;
+                            } else if (IdentifiedDataType.class.isAssignableFrom(clazz)) {
+                                Method method = clazz.getMethod("loadJson", JsonObject.class);
+                                Object newInstance = clazz.newInstance();
+                                method.invoke(newInstance, json);
+                                return newInstance;
+                            }
                         }
-                    };
-                    return input.readObject();
+
+                    } else if (dataType == 7) {
+                        int dataLen = dataBuff.getInt(4);
+                        InputStream buffer = new ByteArrayInputStream(dataBuff.getBytes(8, dataLen + 8));
+                        ObjectInput input = new ObjectInputStream(buffer) {
+                            @Override
+                            protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException,
+                                    ClassNotFoundException {
+                                return classLoader.loadClass(desc.getName());
+                            }
+                        };
+                        return input.readObject();
+                    }
                 }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
             }
-        } catch (Exception e) {
-            throw new RuntimeException(e);
         }
         return null;
     }
@@ -1175,7 +1288,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
     @Override
     public Iterable loadAllKeys() {
-        return keyTableCache.keySet();
+        return isReady() ? keyTableCache.keySet() : Collections.emptyList();
     }
 
     @Override
