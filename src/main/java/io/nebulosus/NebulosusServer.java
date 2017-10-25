@@ -9,15 +9,14 @@ import com.hazelcast.map.merge.LatestUpdateMapMergePolicy;
 import io.jsync.app.ClusterApp;
 import io.jsync.app.core.Cluster;
 import io.jsync.app.core.Config;
+import io.jsync.app.core.Logger;
 import io.jsync.json.JsonObject;
 import io.nebulosus.persistence.DummyDataPersistor;
 import io.nebulosus.ipfs.IPFSCryptoPersistor;
 import io.nebulosus.persistence.NBDataPreloadService;
-import io.nebulosus.sockjs.SockJSService;
+import io.nebulosus.sockjs.SockJSAPIService;
 
-
-
-public class Nebulosus extends ClusterApp {
+public class NebulosusServer extends ClusterApp {
 
     @Override
     protected void prepareConfig(Config config) {
@@ -25,7 +24,6 @@ public class Nebulosus extends ClusterApp {
         // Let's go ahead and prepare the configuration that jsync.io can read.
 
         JsonObject rawConfig = config.rawConfig();
-        rawConfig.putBoolean("disable_saving", false);
 
         JsonObject clusterConfig = rawConfig.getObject("cluster" , new JsonObject());
         clusterConfig.putString("data_persistor", DummyDataPersistor.class.getCanonicalName());
@@ -40,6 +38,16 @@ public class Nebulosus extends ClusterApp {
 
     @Override
     protected void prepareCluster(Cluster cluster) {
+
+        Config config = cluster.config();
+
+        JsonObject rawConfig = config.rawConfig();
+
+        Logger logger = cluster.logger();
+
+        logger.info("Preparing to start NebulosusServer");
+
+        logger.info("Setting up Hazelcast IMap configuration for \"nbdata\".");
 
         // IMPORTANT We need to update the hazelcast configuration
         MapConfig nbDataMapConfig = new MapConfig();
@@ -63,16 +71,24 @@ public class Nebulosus extends ClusterApp {
         nbDataMapConfig.setMapStoreConfig(mapStoreConfig);
 
         // Let's add a hook to tell jsync.io to update the hazelcast config
-        cluster.manager().addConfigHandler(hazelcastConfig -> hazelcastConfig.addMapConfig(nbDataMapConfig));
+        cluster.manager().addConfigHandler(hazelcastConfig -> {
+            logger.info("Storing latest Hazelcast IMap configuration for \"nbdata\".");
+            hazelcastConfig.addMapConfig(nbDataMapConfig);
+        });
+
+        logger.info("Adding base services.");
 
         cluster.addService(new NBDataPreloadService());
-        cluster.addService(new SockJSService());
+
+        boolean enabelSockJS = rawConfig.getBoolean("enable_sockjs");
+
+        cluster.addService(new SockJSAPIService());
 
     }
 
     public static void main(String[] args){
-        Nebulosus nebulosus = new Nebulosus();
+        NebulosusServer nebulosusServer = new NebulosusServer();
 
-        ClusterApp.initialize(nebulosus, "--join");
+        ClusterApp.initialize(nebulosusServer, "--join");
     }
 }
