@@ -12,9 +12,10 @@ import java.util.*;
 import java.util.zip.CRC32;
 
 /**
- * This handles SockJS requests allowing a simple interface to Nebulosus.
+ * This handles SockJS requests allowing a simple interface to Nebulosos. It is easy to implement. Although there is no
+ * official documentation for it, there is a simple NodeJS module implementing it.
  */
-public class SockJSHandler implements Handler<SockJSSocket> {
+public class SockJSAPIHandler implements Handler<SockJSSocket> {
 
     private Logger logger = null;
 
@@ -23,7 +24,7 @@ public class SockJSHandler implements Handler<SockJSSocket> {
     private Map<SockJSSocket, Long> clientSessions = new HashMap<>();
     private IMap<String, Object> nbdata = null;
 
-    public SockJSHandler(Cluster cluster){
+    public SockJSAPIHandler(Cluster cluster){
         // This is where we are currently storing any data that
         // Nebulosus stores.
         nbdata = cluster.data().getMap("nbdata", false);
