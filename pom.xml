@@ -31,9 +31,9 @@
             <version>3.0.5</version>
         </dependency>
         <dependency>
-            <groupId>com.github.ipfs</groupId>
+            <groupId>com.github.nebulosushq</groupId>
             <artifactId>java-ipfs-api</artifactId>
-            <version>v1.2.0</version>
+            <version>master</version>
         </dependency>
     </dependencies>
 
@@ -136,7 +136,7 @@
                     <transformers>
                         <transformer
                                 implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                            <mainClass>io.nebulosus.Nebulosus</mainClass>
+                            <mainClass>io.nebulosus.NebulosusServer</mainClass>
                         </transformer>
                     </transformers>
                     <filters>
