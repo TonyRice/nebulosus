@@ -47,6 +47,10 @@ public class IPFSClientPool {
         this(5, address);
     }
 
+    public IPFSClientPool(int initialSize){
+        this(initialSize, DEFAULT_ADDRESS);
+    }
+
     /**
      * Initialize the pool with a specific number of clients.
      *
