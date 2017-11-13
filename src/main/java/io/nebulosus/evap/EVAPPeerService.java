@@ -435,6 +435,131 @@ public class EVAPPeerService implements ClusterService {
         }
     }
 
+    private void checkStarted() {
+        if (!started) {
+            throw new RuntimeException("It looks like the local EVAPPeerService has not been started!");
+        }
+    }
+
+    /**
+     * This allows you to simply publish a message destined for a specific peer.
+     *
+     * @param peerHash the peer you wish to send the message to
+     * @param data the data you wish to publish
+     * @return returns an instance of this
+     */
+    public EVAPPeerService publish(String peerHash, Buffer data){
+        checkStarted();
+        try {
+            byte[] peerPublicKeyData = getPublicKey(peerHash);
+            if(multiLayerSupportEnabled){
+                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data, this::broadcastMessage);
+            } else {
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data, this::broadcastMessage);
+            }
+        } catch (Exception e) {
+            logger.error("Error Occurred", e);
+        }
+        return this;
+    }
+
+    /**
+     * This allows you to broadcast a log message to a specified peer. Generally
+     * a peer will only display a message from a trusted peer.
+     *
+     * @param peerHash the peer you wish to send the log to
+     * @param message  the actual log message
+     * @return returns an instance of this
+     */
+    public EVAPPeerService log(String peerHash, String message) {
+        checkStarted();
+
+        try {
+            byte[] peerPublicKeyData = getPublicKey(peerHash);
+            if(multiLayerSupportEnabled){
+                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message), this::broadcastMessage);
+            } else {
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message), this::broadcastMessage);
+            }
+        } catch (Exception e) {
+            logger.error("Error Occurred", e);
+        }
+
+        return this;
+    }
+
+    public EVAPPeerService addTrustedPeer(String peerHash) {
+        trustedPeers.add(peerHash);
+        return this;
+    }
+
+    public EVAPPeerService removeTrustedPeer(String peerHash) {
+        trustedPeers.remove(peerHash);
+        return this;
+    }
+
+    public Set<String> trustedPeers() {
+        return new LinkedHashSet<>(trustedPeers);
+    }
+
+    /**
+     * This will attempt to request that a specific peer ensures the persistence of a specific piece of data.
+     *
+     * @param peerHash   the peer you wish to persist the data
+     * @param multihash  the Multihash for the data you wish to persist
+     * @param ackHandler a handler that is trigger when an acknowledgement is received
+     */
+    public EVAPPeerService persist(String peerHash, Multihash multihash, Handler<AsyncResult<Void>> ackHandler) {
+        checkStarted();
+
+        try {
+
+            Buffer buffer = new Buffer();
+
+            // Let's store thy hash.
+            String hash = multihash.toString();
+
+            logger.info("Attempting to persist the data located at \"" + hash + "\'.");
+
+            buffer.appendInt(hash.length());
+            buffer.appendString(hash);
+
+            byte[] peerPublicKeyData = getPublicKey(peerHash);
+
+            Runnable[] broadcastMessage = new Runnable[1];
+
+            if(multiLayerSupportEnabled){
+                if(ackHandler != null){
+                    logger.warn("ACK responses are not currently supported by multilayer messages. This will be supported soon!");
+                }
+                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, new BiConsumer<String, Buffer>() {
+                    @Override
+                    public void accept(String peerAddress, Buffer peerMessage) {
+                        broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
+                        broadcastMessage[0].run();
+                    }
+                });
+            } else {
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, (peerAddress, peerMessage) -> {
+                    broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
+                    broadcastMessage[0].run();
+                }, event -> {
+                    if (event.failed()) {
+                        broadcastMessage[0].run();
+                    }
+                    if (ackHandler != null) {
+                        ackHandler.handle(event);
+                    }
+                }, 10, TimeUnit.SECONDS, 5);
+            }
+
+        } catch (Exception e) {
+            logger.error("Error Occurred", e);
+        }
+
+        return this;
+    }
+
     public EVAPPeerService messageHandler(Handler<EVAPMessage> handler){
         this.messageHandler = handler;
         return this;
@@ -541,28 +666,6 @@ public class EVAPPeerService implements ClusterService {
         return pubsub;
     }
 
-    protected void addTrustedRelayPeer(String peerHash) {
-        trustedPeers.add(peerHash);
-    }
-
-    protected void removeTrustedRelayPeer(String peerHash) {
-        trustedPeers.remove(peerHash);
-    }
-
-    protected boolean isTrustedRelayPeer(String peerHash) {
-        return trustedPeers.contains(peerHash);
-    }
-
-    protected Set<String> listTrustedRelayPeers() {
-        return new LinkedHashSet<>(trustedPeers);
-    }
-
-    private void checkStarted() {
-        if (!started) {
-            throw new RuntimeException("It looks like the local EVAPPeerService has not been started!");
-        }
-    }
-
     /**
      * This will return a raw byte array for the public key tied to a specific peer hash.
      *
@@ -584,99 +687,21 @@ public class EVAPPeerService implements ClusterService {
     }
 
     /**
-     * This allows you to broadcast a log message to a specified peer. Generally
-     * a peer will only display a message from a trusted peer.
-     *
-     * @param peerHash the peer you wish to send the log to
-     * @param message  the actual log message
-     */
-    public EVAPPeerService peerLog(String peerHash, String message) {
-        checkStarted();
-
-        try {
-            byte[] peerPublicKeyData = getPublicKey(peerHash);
-            constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message), this::broadcastMessage);
-        } catch (Exception e) {
-            logger.error("Error Occurred", e);
-        }
-
-        return this;
-    }
-
-    /**
-     * This will attempt to request that a specific peer ensures the persistence of a specific piece of data.
-     *
-     * @param peerHash   the peer you wish to persist the data
-     * @param multihash  the Multihash for the data you wish to persist
-     * @param ackHandler a handler that is trigger when an acknowledgement is received
-     */
-    public EVAPPeerService persistData(String peerHash, Multihash multihash, Handler<AsyncResult<Void>> ackHandler) {
-        checkStarted();
-
-        try {
-
-            Buffer buffer = new Buffer();
-
-            // Let's store thy hash.
-            String hash = multihash.toString();
-
-            logger.info("Attempting to persist the data located at \"" + hash + "\'.");
-
-            buffer.appendInt(hash.length());
-            buffer.appendString(hash);
-
-            byte[] peerPublicKeyData = getPublicKey(peerHash);
-
-            Runnable[] broadcastMessage = new Runnable[1];
-
-            if(multiLayerSupportEnabled){
-                if(ackHandler != null){
-                    logger.warn("ACK responses are not currently supported by multilayer messages. This will be supported soon!");
-                }
-                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, new BiConsumer<String, Buffer>() {
-                    @Override
-                    public void accept(String peerAddress, Buffer peerMessage) {
-                        broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
-                        broadcastMessage[0].run();
-                    }
-                });
-            } else {
-                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, (peerAddress, peerMessage) -> {
-                    broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
-                    broadcastMessage[0].run();
-                }, event -> {
-                    if (event.failed()) {
-                        broadcastMessage[0].run();
-                    }
-                    if (ackHandler != null) {
-                        ackHandler.handle(event);
-                    }
-                }, 10, TimeUnit.SECONDS, 5);
-            }
-
-        } catch (Exception e) {
-            logger.error("Error Occurred", e);
-        }
-
-        return this;
-    }
-
-    /**
      * This is simply a helper function.
      */
     private void broadcastMessage(String address, Buffer message) {
         pubsub.pub(address, Base64.encodeBytes(message.getBytes()));
     }
 
-    protected void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer){
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer){
         constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, consumer, null, -1, null, -1);
     }
 
-    protected void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler){
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler){
         constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, consumer, ackHandler, -1, null, 5);
     }
 
-    protected void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler, long ackTimeout, TimeUnit ackTimeoutTimeUnit, int rebroadcastCount) {
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler, long ackTimeout, TimeUnit ackTimeoutTimeUnit, int rebroadcastCount) {
 
         PublicKey peerKey = generateRSAPublicKey(peerPublicKeyData);
 
