@@ -6,11 +6,12 @@ import io.jsync.AsyncFactory;
 import io.jsync.Handler;
 import io.jsync.app.ClusterApp;
 import io.jsync.app.core.Logger;
+import io.jsync.buffer.Buffer;
 import io.jsync.json.JsonObject;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.function.Supplier;
 
 /**
@@ -20,6 +21,7 @@ public class AsyncPubSub {
 
     private Logger logger = null;
 
+    private Map<String, ExecutorService> topicExecutors = new ConcurrentHashMap<>();
     private Map<String, Supplier<Object>> topicSuppliers = new ConcurrentHashMap<>();
     private Map<String, Handler<JsonObject>> handlerMap = new ConcurrentHashMap<>();
 
@@ -54,33 +56,41 @@ public class AsyncPubSub {
         this.ipfs = ipfs;
         this.async = async;
 
-        // TODO check if this is resource intensive or not.
-        async.setPeriodic(1, event -> {
+        // Note: This needs improvement.
+        async.setPeriodic(1500, event -> {
             try {
+                if(topicSuppliers.size() > 0){
+                    for (Map.Entry<String, Supplier<Object>> entry : topicSuppliers.entrySet()) {
+                        final String topic = entry.getKey();
+                        if(!topicExecutors.containsKey(topic)){
+                            ExecutorService executorService = Executors.newSingleThreadExecutor();
+                            final Supplier<Object> supplier = entry.getValue();
+                            executorService.submit(() -> {
+                                while (topicSuppliers.containsKey(topic)){
+                                    Object result = supplier.get();
+                                    Map mapResult = (Map) result;
+                                    if(mapResult.size() > 0){
+                                        try {
+                                            JsonObject jsonObject = new JsonObject(mapResult);
+                                            Handler<JsonObject> handler = handlerMap.get(topic);
+                                            if(handler != null){
+                                                async.runOnContext(event1 -> handler.handle(jsonObject));
+                                            }
+                                        } catch (Exception ignored){
+                                        }
+                                    }
+                                    try {
+                                        Thread.sleep(5);
+                                    } catch (InterruptedException e) {
+                                        e.printStackTrace();
+                                    }
+                                }
+                            });
 
-                for (Map.Entry<String, Supplier<Object>> entry : topicSuppliers.entrySet()) {
-                    String topic = entry.getKey();
-                    Supplier<Object> supplier = entry.getValue();
+                            topicExecutors.put(topic, executorService);
+                        }
 
-                    async.executeBlocking(() -> {
-                        try {
-                            Object result = supplier.get();
-                            Map mapResult = (Map) result;
-                            if(mapResult.size() > 0){
-                                return new JsonObject(mapResult);
-                            }
-                        } catch (Exception ignored){
-                        }
-                        return null;
-                    }, event12 -> {
-                        JsonObject result = event12.result();
-                        if(result != null){
-                            Handler<JsonObject> handler = handlerMap.get(topic);
-                            if(handler != null){
-                                async.runOnContext(event1 -> handler.handle(result));
-                            }
-                        }
-                    });
+                    }
                 }
             } catch (Exception e){
                 logger.error("processing error", e);
@@ -109,7 +119,38 @@ public class AsyncPubSub {
     }
 
     /**
-     * Handle data for the specified topic.
+     * Publish data to the specified IPFS topic.
+     *
+     * @param topic the topic
+     * @param data the data
+     *
+     * @return an instance of this
+     */
+    public AsyncPubSub pub(String topic, byte[] data){
+        return pub(topic, new Buffer(data));
+    }
+
+    /**
+     * Publish data to the specified IPFS topic.
+     *
+     * @param topic the topic
+     * @param data the data
+     *
+     * @return an instance of this
+     */
+    public AsyncPubSub pub(String topic, Buffer data){
+        async.runOnContext(event -> {
+            try {
+                ipfs.pubsub.pub(topic, data.toString());
+            } catch (IOException e) {
+                logger.error("Error calling pub", e);
+            }
+        });
+        return this;
+    }
+
+    /**
+     * Handle events for the specified topic.
      *
      * @param topic the topic
      * @param handler the handler
@@ -120,6 +161,7 @@ public class AsyncPubSub {
         async.runOnContext(event -> {
             if(!topicSuppliers.containsKey(topic)){
                 try {
+                    logger.info("Registering handler for the topic \"" + topic + "\".");
                     topicSuppliers.put(topic, ipfs.pubsub.sub(topic));
                 } catch (IOException e) {
                     logger.error("Error calling sub", e);

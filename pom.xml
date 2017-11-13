@@ -9,37 +9,13 @@
     <version>0.0.2-SNAPSHOT</version>
 
     <name>Nebulosus</name>
-    <description>Nebulosus is a distributed key-value store.</description>
+    <description>Nebulosus is a distributed key-value store utilizing the Evaporation Protocol</description>
     <url>http://nebulosus.io/</url>
-
-    <repositories>
-        <repository>
-            <id>jitpack.io</id>
-            <url>https://jitpack.io</url>
-        </repository>
-    </repositories>
-
-    <dependencies>
-        <dependency>
-            <groupId>me.tonyrice.oss</groupId>
-            <artifactId>jsync.io</artifactId>
-            <version>1.10.16-SNAPSHOT</version>
-        </dependency>
-        <dependency>
-            <groupId>org.mapdb</groupId>
-            <artifactId>mapdb</artifactId>
-            <version>3.0.5</version>
-        </dependency>
-        <dependency>
-            <groupId>com.github.nebulosushq</groupId>
-            <artifactId>java-ipfs-api</artifactId>
-            <version>master</version>
-        </dependency>
-    </dependencies>
 
     <properties>
         <!-- Dependencies -->
-        <jsyncio.version>1.10.15</jsyncio.version>
+        <jsyncio.version>1.10.16-SNAPSHOT</jsyncio.version>
+        <mapdb.version>3.0.5</mapdb.version>
         <jimfs.version>1.1</jimfs.version>
 
         <!-- Plugins -->
@@ -54,6 +30,46 @@
         <java.version>1.8</java.version>
     </properties>
 
+    <repositories>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
+    </repositories>
+
+    <dependencies>
+        <dependency>
+            <groupId>me.tonyrice.oss</groupId>
+            <artifactId>jsync.io</artifactId>
+            <version>${jsyncio.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.mapdb</groupId>
+            <artifactId>mapdb</artifactId>
+            <version>${mapdb.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.jimfs</groupId>
+            <artifactId>jimfs</artifactId>
+            <version>${jimfs.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.github.nebulosushq</groupId>
+            <artifactId>java-ipfs-api</artifactId>
+            <version>master</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>com.github.multiformats</groupId>
+                    <artifactId>java-multiaddr</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.github.nebulosushq</groupId>
+            <artifactId>java-multiaddr</artifactId>
+            <version>master</version>
+        </dependency>
+    </dependencies>
     <build>
         <resources>
             <resource>

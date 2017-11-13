@@ -77,9 +77,7 @@ public class JsonQueryPredicate implements Serializable, Predicate {
         boolean success = false;
 
         for(String field : query.getFieldNames()){
-
             Object queryValue = query.getValue(field);
-
             if(field.contains(".")){
                 String[] subFields = field.split("\\.");
                 JsonObject newValue = null;

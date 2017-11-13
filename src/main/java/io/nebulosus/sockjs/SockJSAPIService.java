@@ -11,7 +11,8 @@ import io.jsync.json.JsonObject;
 import io.jsync.sockjs.SockJSServer;
 
 /**
- * This provides the critical layer that allows clients to communicate with Nebulosus.
+ * This provides a simple SockJS based api for storing and retrieving information. Generally any language can easily
+ * connect to this and implement their own client library.
  */
 public class SockJSAPIService implements ClusterService {
 
@@ -38,7 +39,7 @@ public class SockJSAPIService implements ClusterService {
         int serverPort = sockServerConfig.getInteger("port", DEFAULT_PORT);
         String serverHost = sockServerConfig.getString("host", "127.0.0.1");
 
-        boolean enabled = sockServerConfig.getBoolean("enabled" , true);
+        boolean enabled = sockServerConfig.getBoolean("enabled", true);
 
         sockServerConfig.putBoolean("enabled", enabled);
         sockServerConfig.putNumber("port", serverPort);
@@ -48,9 +49,7 @@ public class SockJSAPIService implements ClusterService {
 
         config.save();
 
-        serviceStarted = true;
-
-        if(enabled){
+        if (enabled) {
 
             logger.info("SockJS support is currently enabled.");
 
@@ -73,6 +72,7 @@ public class SockJSAPIService implements ClusterService {
                     logger.fatal("Could not start SockJS server on " + serverHost + ":" + serverPort);
                     return;
                 }
+                serviceStarted = true;
                 logger.info("SockJS server started on " + serverHost + ":" + serverPort);
             });
             return;
@@ -83,18 +83,23 @@ public class SockJSAPIService implements ClusterService {
 
     @Override
     public void stop() {
-        if(httpServer != null){
-            try {
-                logger.info("Stopping the local SockJS server.");
-                httpServer.close();
-            } catch (Exception ignored){
+        try {
+            if (httpServer != null) {
+                try {
+                    logger.info("Stopping the local SockJS server.");
+                    httpServer.close();
+                } catch (Exception ignored) {
+                }
             }
+        } finally {
+            serviceStarted = false;
+            httpServer = null;
         }
     }
 
     @Override
     public boolean running() {
-        return serviceStarted;
+        return serviceStarted && httpServer != null;
     }
 
     @Override

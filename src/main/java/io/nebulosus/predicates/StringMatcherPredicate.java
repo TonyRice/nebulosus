@@ -43,12 +43,11 @@ public class StringMatcherPredicate implements Serializable, Predicate {
                                 return true;
                             }
                         }
-                    } catch (IllegalAccessException e) {
+                    } catch (IllegalAccessException ignored) {
                     }
                 }
             }
         } catch (Exception ignored){
-            ignored.printStackTrace();
         }
         return false;
     }

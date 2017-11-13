@@ -23,6 +23,15 @@ public class IPFSClientPool {
 
     final public static String DEFAULT_ADDRESS = "/ip4/127.0.0.1/tcp/5001";
 
+    private static IPFSClientPool DEFAULT_INSTANCE = null;
+
+    public static IPFSClientPool defaultInstance(){
+        if(DEFAULT_INSTANCE == null){
+            DEFAULT_INSTANCE = new IPFSClientPool(5);
+        }
+        return DEFAULT_INSTANCE;
+    }
+
     private Async async = null;
     private Logger logger = null;
 
@@ -80,8 +89,9 @@ public class IPFSClientPool {
         try {
             IPFS ipfs = new IPFS(DEFAULT_ADDRESS);
             ipfs.version();
+            logger.info("Connection to \"" + DEFAULT_ADDRESS + "\" succeeded!");
         } catch (Exception e){
-            logger.info("Connection to \"" + DEFAULT_ADDRESS + "\" failed.");
+            logger.warn("Connection to \"" + DEFAULT_ADDRESS + "\" failed.");
             CountDownLatch waitLatch = new CountDownLatch(1);
             ipfsDaemonThread = new Thread(() -> {
                 try {
@@ -119,7 +129,7 @@ public class IPFSClientPool {
                     async.setPeriodic(25, event -> {
                         try {
                             String line = stdoutReader.readLine();
-                            if(line.equals("Daemon is ready")){
+                            if(line != null && line.equals("Daemon is ready")){
                                 logger.info("The IPFS daemon is ready!");
                                 async.cancelTimer(event);
                                 waitLatch.countDown();
@@ -132,7 +142,7 @@ public class IPFSClientPool {
                     process.waitFor();
 
                     if(waitLatch.getCount() > 0){
-                        logger.error("It looks like the IPFS daemon could not be start.ed");
+                        logger.error("It looks like the IPFS daemon could not be started!");
 
                         waitLatch.countDown();
                     }
@@ -180,8 +190,9 @@ public class IPFSClientPool {
      *
      * @param instance
      */
-    public void release(IPFS instance){
+    public IPFSClientPool release(IPFS instance){
         ipfsList.add(instance);
+        return this;
     }
 
 }

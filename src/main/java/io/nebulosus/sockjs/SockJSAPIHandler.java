@@ -12,8 +12,7 @@ import java.util.*;
 import java.util.zip.CRC32;
 
 /**
- * This handles SockJS requests allowing a simple interface to Nebulosos. It is easy to implement. Although there is no
- * official documentation for it, there is a simple NodeJS module implementing it.
+ * This handles requests for the SockJSAPIService.
  */
 public class SockJSAPIHandler implements Handler<SockJSSocket> {
 
@@ -60,14 +59,11 @@ public class SockJSAPIHandler implements Handler<SockJSSocket> {
                     pos += 4;
 
                     if(buffer.length() >= pos + uuidLen){
-
                         String callbackId = buffer.getString(pos, pos + uuidLen);
-
                         Buffer replyCB = new Buffer();
                         replyCB.appendByte((byte) 12);
                         replyCB.appendInt(callbackId.length());
                         replyCB.appendString(callbackId);
-
                         sock.write(replyCB);
                     }
                 }
@@ -144,15 +140,12 @@ public class SockJSAPIHandler implements Handler<SockJSSocket> {
                     }
                 }
 
-                // Looks like there's no session!
                 if(!clientSessions.containsKey(sock)){
                     logger.warn("Session error from \"" + hostStr + "\"!");
-
                     sock.close();
                     return;
                 }
 
-                // Let's process commands below
                 if(cmd == 81){
                     // Remove
 
@@ -196,7 +189,7 @@ public class SockJSAPIHandler implements Handler<SockJSSocket> {
                         return;
                     }
 
-                    // TODO we are currently sending strings back
+                    // TODO we are currently sending strings only back
 
                     Object data = nbdata.get(key);
 

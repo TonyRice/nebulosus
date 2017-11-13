@@ -19,42 +19,35 @@ import io.jsync.eventbus.EventBus;
 import io.jsync.eventbus.Message;
 import io.jsync.file.FileSystem;
 import io.jsync.impl.DefaultFutureResult;
+import io.jsync.json.JsonArray;
 import io.jsync.json.JsonObject;
 import io.jsync.json.impl.Base64;
 import io.jsync.logging.Logger;
 import io.jsync.logging.impl.LoggerFactory;
 import io.jsync.utils.CryptoUtils;
+import io.nebulosus.evap.EVAPPeerService;
+import io.nebulosus.util.CryptoUtil;
 import org.mapdb.DB;
 import org.mapdb.DBMaker;
 import org.mapdb.HTreeMap;
 
 import javax.crypto.*;
 import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.PBEKeySpec;
-import javax.crypto.spec.SecretKeySpec;
 import java.io.*;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.security.AlgorithmParameters;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
-import java.security.spec.InvalidParameterSpecException;
-import java.security.spec.KeySpec;
 import java.util.*;
 import java.util.concurrent.*;
 
-/**
- * The IPFSCryptoPersistor provides a powerful persistence layer to Hazelcast. This gives the system the ability
- * to persist data in a way that ensures it's longevity no matter what happens to a single node.
- */
-public class IPFSCryptoPersistor implements DataPersistor {
+import static io.nebulosus.util.CryptoUtil.DEFAULT_CIPHER;
 
-    final public static String DEFAULT_RANDOM = "SHA1PRNG";
-    final public static String DEFAULT_SECRET_KEY_SPEC = "AES";
-    final public static String DEFAULT_KEY_FACTORY = "PBKDF2WithHmacSHA512";
-    final public static String DEFAULT_CIPHER = "AES/CBC/PKCS5Padding";
+/**
+ * The IPFSCryptoPersistor is adds an IPFS based data persistence layer to jsync.io. It also implements the EVAPPeerService
+ * to support the Evaporation Protocol. This helps ensure your IPFS data is persisted in a secure manner.
+ **/
+public class IPFSCryptoPersistor implements DataPersistor {
 
     private Cluster cluster = null;
     private HazelcastInstance hazelcast = null;
@@ -75,6 +68,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
     private SecretKey secretKey = null;
     private String cryptoPass = "";
 
+    private String shortMapHash = null;
     private String mapHash = null;
 
     private HTreeMap keyTableCache = null;
@@ -89,6 +83,9 @@ public class IPFSCryptoPersistor implements DataPersistor {
     private Set<Handler<Void>> readyHandlers = new LinkedHashSet<>();
 
     private boolean initialized = false;
+
+    private List<String> evapPeers = new LinkedList<>();
+    private boolean evapEnabled = false;
 
     @Override
     public void init(HazelcastInstance hazelcastInstance, Properties properties, String mapName) {
@@ -113,6 +110,9 @@ public class IPFSCryptoPersistor implements DataPersistor {
         Config config = current.cluster().config();
 
         if (config == null) {
+
+            System.out.println("Config is empty!");
+
             config = new Config();
             config.open(config.getConfigPath());
         }
@@ -120,65 +120,59 @@ public class IPFSCryptoPersistor implements DataPersistor {
         JsonObject clusterConfig = config.rawConfig().getObject("cluster", new JsonObject());
         JsonObject ipfsConfig = clusterConfig.getObject("ipfs", new JsonObject());
 
-        String store = ipfsConfig.getString("store", "ipfs_crypto");
-        String storePass = ipfsConfig.getString("pass", "ChangeMeNow!");
-        String saltData = ipfsConfig.getString("shash", "");
+        // This may be completely irrelevant
+        //String store = ipfsConfig.getString("store", "ipfs_crypto");
+        String storePass = ipfsConfig.getString("crypto_pass", "ChangeMeNow!");
+        String saltData = ipfsConfig.getString("crypto_shash", "");
 
-        ipfsConfig.putString("store", store);
-        ipfsConfig.putString("pass", storePass);
+        //ipfsConfig.putString("store", store);
+        ipfsConfig.putString("crypto_pass", storePass);
 
-        sharedData = hazelcast.getMap("shared");
+        evapEnabled = ipfsConfig.getBoolean("evap_enabled", true);
+
+        if(evapEnabled){
+            logger.info("Initializing with EVAP support enabled.");
+            for (Object evapPeer : ipfsConfig.getArray("evap_peers", new JsonArray())) {
+                evapPeers.add(evapPeer.toString());
+            }
+        }
+
+        // This allows us to handle some clustered
+        // shared data.
+        sharedData = hazelcast.getMap("shared" + mapHash);
 
         logger.info("Verifying connection to IPFS.");
 
-        logger.info("IPFS has been successfully connected!");
+        this.cryptoPass = storePass;
 
-        logger.info("Initializing MapDB for key table storage.");
+        logger.info("IPFS has been successfully connected!");
 
         IPFS ipfs = ipfsClientPool.get();
 
         try {
+            if(saltData == null || saltData.isEmpty()){
+                secretKey = CryptoUtil.generateSecretKey(cryptoPass, salt -> {
+                    try {
+                        NamedStreamable.ByteArrayWrapper saltFile = new NamedStreamable.ByteArrayWrapper(CryptoUtils.calculateSHA1(salt), salt);
+                        List<MerkleNode> addResult = ipfs.add(saltFile);
 
-            // TODO evaluate security of this.
-            // Begin SecretKey generation
-            SecretKey secret;
+                        // Ensure we pin this.
+                        ipfs.pin.add(addResult.get(0).hash);
 
-            SecretKeyFactory factory = SecretKeyFactory.getInstance(DEFAULT_KEY_FACTORY);
-
-            if (saltData.isEmpty()) {
-
-                SecureRandom sr = SecureRandom.getInstance(DEFAULT_RANDOM);
-                byte[] salt = new byte[16];
-                sr.nextBytes(salt);
-
-                NamedStreamable.ByteArrayWrapper saltFile = new NamedStreamable.ByteArrayWrapper(CryptoUtils.calculateSHA1(salt), salt);
-                List<MerkleNode> addResult = ipfs.add(saltFile, true);
-                saltData = addResult.get(0).hash.toString();
-
-                KeySpec spec = new PBEKeySpec(cryptoPass.toCharArray(), salt, 65536, 128);
-                SecretKey tmp = factory.generateSecret(spec);
-                secret = new SecretKeySpec(tmp.getEncoded(), DEFAULT_SECRET_KEY_SPEC);
-
+                        ipfsConfig.putString("crypto_shash", addResult.get(0).hash.toString());
+                    } catch (Exception e){
+                        e.printStackTrace();
+                    }
+                });
             } else {
+                // Let's go ahead and retrieve the salt from IPFS
                 Multihash saltPointer = Multihash.fromBase58(saltData);
                 byte[] salt = ipfs.cat(saltPointer);
-                KeySpec spec = new PBEKeySpec(cryptoPass.toCharArray(), salt, 65536, 128);
-                SecretKey tmp = factory.generateSecret(spec);
-                secret = new SecretKeySpec(tmp.getEncoded(), DEFAULT_SECRET_KEY_SPEC);
+                secretKey = CryptoUtil.generateSecretKey(cryptoPass, salt);
             }
 
-            secretKey = secret;
-
-            // End SecretKey Generation
-
-            ipfsConfig.putString("shash", saltData);
-
-            // Let's make sure we save the config
-            clusterConfig.putObject("ipfs", ipfsConfig);
-            config.rawConfig().putObject("cluster", clusterConfig);
-            config.save();
-
-            mapHash = CryptoUtils.calculateSHA1(mapName.getBytes());
+            mapHash = CryptoUtils.calculateHmacSHA1(mapName.getBytes(), CryptoUtils.calculateSHA512((cryptoPass + mapName).getBytes()));
+            shortMapHash = mapHash.substring(0, 12);
 
             Config finalConfig = config;
 
@@ -241,13 +235,13 @@ public class IPFSCryptoPersistor implements DataPersistor {
                             // We initializing the database it will load all thy keys..
                             String vtIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\\n", "");
 
-                            String previous = ipfsConfig.getString("vt_index", "");
+                            String previous = ipfsConfig.getString(shortMapHash + "vt_index", "");
 
                             if (!previous.isEmpty()) {
                                 logger.info("Replacing previous vt index \"" + previous + "\" with \"" + vtIndex + "\".");
                             }
 
-                            ipfsConfig.putString("vt_index", vtIndex);
+                            ipfsConfig.putString(shortMapHash + "vt_index", vtIndex);
 
                             // Let's make sure we save the config
                             clusterConfig.putObject("ipfs", ipfsConfig);
@@ -255,7 +249,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                             finalConfig.rawConfig().putObject("cluster", clusterConfig);
                             finalConfig.save();
 
-                            logger.info("Saved latest vt index.");
+                            logger.info("Saved latest value table index for the map \"" + mapName + "\".");
 
                             valueTableIndex = vtIndex;
 
@@ -265,13 +259,13 @@ public class IPFSCryptoPersistor implements DataPersistor {
                             // We initializing the database it will load all thy keys..
                             String ktIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\n", "");
 
-                            String previous = ipfsConfig.getString("kt_index", "");
+                            String previous = ipfsConfig.getString(shortMapHash + "kt_index", "");
 
                             if (!previous.isEmpty()) {
                                 logger.info("Replacing previous key-table index \"" + previous + "\" with \"" + ktIndex + "\".");
                             }
 
-                            ipfsConfig.putString("kt_index", ktIndex);
+                            ipfsConfig.putString(shortMapHash + "kt_index", ktIndex);
 
                             // Let's make sure we save the config
                             clusterConfig.putObject("ipfs", ipfsConfig);
@@ -279,7 +273,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                             finalConfig.rawConfig().putObject("cluster", clusterConfig);
                             finalConfig.save();
 
-                            logger.info("Saved latest key table index.");
+                            logger.info("Saved latest key table index for the map \"" + mapName + "\".");
 
                             keyTableIndex = ktIndex;
 
@@ -287,7 +281,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                     });
                 });
 
-                keyTableIndex = ipfsConfig.getString("kt_index", "");
+                keyTableIndex = ipfsConfig.getString(shortMapHash + "kt_index", "");
 
                 loadKeyTable();
 
@@ -396,9 +390,15 @@ public class IPFSCryptoPersistor implements DataPersistor {
                 finishStartup.handle(null);
             }
 
-
+            // Let's make sure we save the config
+            clusterConfig.putObject("ipfs", ipfsConfig);
+            config.rawConfig().putObject("cluster", clusterConfig);
+            config.save();
 
         } catch (Exception e) {
+            if(config.isDebug()){
+                e.printStackTrace();
+            }
             throw new RuntimeException(e);
         } finally {
             ipfsClientPool.release(ipfs);
@@ -440,7 +440,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
     }
 
     /**
-     * This will load all the data that is stored within Nebulosus.
+     * This will load all the data that is stored within NebulosusServer.
      */
     private void loadKeyTable() {
 
@@ -477,8 +477,15 @@ public class IPFSCryptoPersistor implements DataPersistor {
             forceUpdate = true;
         }
 
-        String keyTableCacheFile = "ktcache.db";
-        String valueTableCacheFile = "vtcache.db";
+        String keyTableCacheFile = "nbdata/kt" + shortMapHash + ".db";
+        String valueTableCacheFile = "nbdata/vt" + shortMapHash + ".db";
+
+        if(!Files.exists(Paths.get("nbdata"))){
+            try {
+                Files.createDirectory(Paths.get("nbdata"));
+            } catch (IOException ignored) {
+            }
+        }
 
         // This means we need to initialize a new one.
         if (keyTableIndex == null || keyTableIndex.isEmpty()) {
@@ -643,7 +650,14 @@ public class IPFSCryptoPersistor implements DataPersistor {
                 // When update, each non-master node will go ahead and re-open the
                 // table with the latest values.
 
-                String tmpFile = "ktcache.tmp.db";
+                String tmpFile = "nbdata/kt" + shortMapHash + ".tmp.db";
+
+                if(!Files.exists(Paths.get("nbdata"))){
+                    try {
+                        Files.createDirectory(Paths.get("nbdata"));
+                    } catch (IOException ignored) {
+                    }
+                }
 
                 FileSystem fs = localAsync.fileSystem();
 
@@ -764,7 +778,14 @@ public class IPFSCryptoPersistor implements DataPersistor {
                 // When update, each non-master node will go ahead and re-open the
                 // table with the latest values.
 
-                String tmpFile = "vtcache.tmp.db";
+                String tmpFile = "nbdata/vt" + shortMapHash + ".tmp.db";
+
+                if(!Files.exists(Paths.get("nbdata"))){
+                    try {
+                        Files.createDirectory(Paths.get("nbdata"));
+                    } catch (IOException ignored) {
+                    }
+                }
 
                 FileSystem fs = localAsync.fileSystem();
 
@@ -950,7 +971,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                 // is an encrypted ipfs blob.
                 newData.appendInt(12);
 
-                String hash = storeIpfsData(CryptoUtils.calculateSHA1(iv), encrypted, true);
+                String hash = storeIPFSData(CryptoUtils.calculateSHA1(iv), encrypted, true);
 
                 newData.appendInt(hash.length());
                 newData.appendString(hash);
@@ -976,17 +997,20 @@ public class IPFSCryptoPersistor implements DataPersistor {
     private Buffer decryptMessageData(Buffer data) {
 
         try {
+            int pos = 0;
+            int ivHashLen = data.getInt(pos);
+            pos += 4;
+            String ivHash = data.getString(pos, ivHashLen + pos);
+            pos += ivHashLen;
 
-            int ivHashLen = data.getInt(0);
-            String ivHash = data.getString(4, ivHashLen + 4);
-
-            int dataLen = data.getInt(ivHashLen + 4);
+            int dataLen = data.getInt(pos);
+            pos += 4;
 
             // We need to retrieve the iv from Hazelcast.
             // We can also remove it too.
             byte[] iv = (byte[]) sharedData.get(ivHash);
 
-            byte[] encrypted = data.getBytes(ivHashLen + 8, dataLen + ivHashLen + 8);
+            byte[] encrypted = data.getBytes(pos, dataLen + pos);
 
             Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
             IvParameterSpec ivParameterSpec = new IvParameterSpec(iv);
@@ -1023,8 +1047,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
             return newData;
 
-        } catch (BadPaddingException | IllegalBlockSizeException | InvalidParameterSpecException | NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException e) {
-            e.printStackTrace();
+        } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
@@ -1047,16 +1070,23 @@ public class IPFSCryptoPersistor implements DataPersistor {
         }, event -> eventBus.publish("nb.event." + mapHash, event.result()));
     }
 
-    private String storeIpfsData(String name, byte[] data, boolean save) {
+    private String storeIPFSData(String name, byte[] data, boolean save) {
         // Not sure if this is too safe :D
         NamedStreamable.ByteArrayWrapper encIpfsData = new NamedStreamable.ByteArrayWrapper(name, data);
         List<MerkleNode> addResult;
-        // TODO autodetect pinning
         IPFS ipfs = ipfsClientPool.get();
         try {
-            addResult = ipfs.add(encIpfsData, save);
+            addResult = ipfs.add(encIpfsData);
+            if(save){
+                ipfs.pin.add(addResult.get(0).hash);
+            }
+
+            EVAPPeerService.ready(evapPeerService -> {
+                for (String evapPeer : evapPeers) {
+                    evapPeerService.persistData(evapPeer, addResult.get(0).hash, null);
+                }
+            });
         } catch (IOException e) {
-            e.printStackTrace();
             throw new RuntimeException(e);
         } finally {
             ipfsClientPool.release(ipfs);
@@ -1124,6 +1154,16 @@ public class IPFSCryptoPersistor implements DataPersistor {
             Float aFloat = (Float) value;
             dataBuffer.appendInt(4);
             dataBuffer.appendFloat(aFloat);
+        } else if(value instanceof byte[]){
+            byte[] data = (byte[]) value;
+            dataBuffer.appendInt(15);
+            dataBuffer.appendLong(data.length);
+            dataBuffer.appendBytes(data);
+        } else if(value instanceof Buffer){
+            Buffer data = (Buffer) value;
+            dataBuffer.appendInt(16);
+            dataBuffer.appendLong(data.length());
+            dataBuffer.appendBuffer(data);
         } else if (value instanceof DataType) {
 
             String className = value.getClass().getCanonicalName();
@@ -1227,22 +1267,38 @@ public class IPFSCryptoPersistor implements DataPersistor {
                     // Let's retrieve the data automatically.
                     Buffer dataBuff = decryptCryptoBlob((byte[]) keyTableCache.get(o));
 
-                    int dataType = dataBuff.getInt(0);
+                    int pos = 0;
+                    int dataType = dataBuff.getInt(pos);
+                    pos += 4;
                     if (dataType == 1) {
-                        return dataBuff.getString(8, dataBuff.getInt(4) + 8);
+                        int strLen = dataBuff.getInt(pos);
+                        pos += 4;
+                        return dataBuff.getString(pos, strLen + pos);
                     } else if (dataType == 2) {
                         return dataBuff.getLong(4);
                     } else if (dataType == 3) {
                         return dataBuff.getInt(4);
                     } else if (dataType == 4) {
                         return dataBuff.getFloat(4);
+                    } else if(dataType == 15){
+                        long dataLen = dataBuff.getLong(pos);
+                        pos += 8;
+                        return dataBuff.getBytes(pos, (int) (pos + dataLen));
+                    } else if(dataType == 16){
+                        long dataLen = dataBuff.getLong(pos);
+                        pos += 8;
+                        return dataBuff.getBuffer(pos, (int) (pos + dataLen));
                     } else if (dataType == 5) {
 
-                        int classLen = dataBuff.getInt(4);
-                        String className = dataBuff.getString(8, classLen + 8);
+                        int classLen = dataBuff.getInt(pos);
+                        pos += 4;
+                        String className = dataBuff.getString(pos, classLen + pos);
+                        pos += classLen;
 
-                        int dataLen = dataBuff.getInt(classLen + 8);
-                        byte[] datas = dataBuff.getBytes(classLen + 12, classLen + dataLen + 12);
+                        int dataLen = dataBuff.getInt(pos);
+
+                        pos += 4;
+                        byte[] datas = dataBuff.getBytes(pos, dataLen + pos);
 
                         JsonObject json = new JsonObject(new String(datas));
 

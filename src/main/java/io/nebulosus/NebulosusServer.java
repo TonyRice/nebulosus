@@ -4,36 +4,54 @@ import com.hazelcast.config.EvictionPolicy;
 import com.hazelcast.config.InMemoryFormat;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MapStoreConfig;
+import com.hazelcast.core.IMap;
+import com.hazelcast.core.MapLoader;
 import com.hazelcast.core.MapStoreFactory;
 import com.hazelcast.map.merge.LatestUpdateMapMergePolicy;
 import io.jsync.app.ClusterApp;
 import io.jsync.app.core.Cluster;
 import io.jsync.app.core.Config;
 import io.jsync.app.core.Logger;
+import io.jsync.app.core.persistence.impl.DummyDataPersistor;
+import io.jsync.app.core.service.ClusterService;
 import io.jsync.json.JsonObject;
-import io.nebulosus.persistence.DummyDataPersistor;
+import io.jsync.logging.impl.LoggerFactory;
+import io.nebulosus.evap.EVAPPeerService;
 import io.nebulosus.ipfs.IPFSCryptoPersistor;
-import io.nebulosus.persistence.NBDataPreloadService;
 import io.nebulosus.sockjs.SockJSAPIService;
+
+import java.util.Arrays;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Properties;
 
 public class NebulosusServer extends ClusterApp {
 
+    static {
+        System.setProperty("java.net.preferIPv4Stack", "true");
+
+        System.setProperty("hazelcast.phone.home.enabled", "false");
+        System.setProperty("hazelcast.socket.bind.any", "false");
+        System.setProperty("async.pool.eventloop.size", String.valueOf(Runtime.getRuntime().availableProcessors() * 2));
+        System.setProperty("async.pool.worker.size", String.valueOf(Runtime.getRuntime().availableProcessors() * 10));
+
+        System.setProperty("org.apache.sshd.security.provider.BC.enabled", "false");
+
+        if(System.getProperty("java.util.logging.config.file") == null){
+            System.setProperty("java.util.logging.config.file", "default_logging.properties");
+            System.setProperty(LoggerFactory.LOGGER_PROPERTIES_FILE, "default_logging.properties");
+        } else {
+            System.setProperty(LoggerFactory.LOGGER_PROPERTIES_FILE, System.getProperty("java.util.logging.config.file"));
+        }
+    }
+
     @Override
     protected void prepareConfig(Config config) {
-
-        // Let's go ahead and prepare the configuration that jsync.io can read.
-
-        JsonObject rawConfig = config.rawConfig();
-
-        JsonObject clusterConfig = rawConfig.getObject("cluster" , new JsonObject());
+        JsonObject jsonConfig = config.rawConfig();
+        JsonObject clusterConfig = jsonConfig.getObject("cluster" , new JsonObject());
         clusterConfig.putString("data_persistor", DummyDataPersistor.class.getCanonicalName());
-
-        // Ideally there is node and pnode
-        // This means it is a regular nebulosus node.
         clusterConfig.putString("role", "node");
-
-        rawConfig.putObject("cluster", clusterConfig);
-
+        jsonConfig.putObject("cluster", clusterConfig);
     }
 
     @Override
@@ -41,14 +59,15 @@ public class NebulosusServer extends ClusterApp {
 
         Config config = cluster.config();
 
-        JsonObject rawConfig = config.rawConfig();
+        JsonObject jsonConfig = config.rawConfig();
 
         Logger logger = cluster.logger();
 
-        logger.info("Preparing to start NebulosusServer");
+        logger.info("Preparing to start NebulosusServer...");
 
-        logger.info("Setting up Hazelcast IMap configuration for \"nbdata\".");
+        logger.info("Setting up Hazelcast IMap configuration for \"nbdata\"...");
 
+        // -- IMPORTANT --
         // IMPORTANT We need to update the hazelcast configuration
         MapConfig nbDataMapConfig = new MapConfig();
         nbDataMapConfig.setName("nbdata");
@@ -63,32 +82,74 @@ public class NebulosusServer extends ClusterApp {
         mapStoreConfig.setWriteDelaySeconds(0);
         mapStoreConfig.setEnabled(true);
 
-        mapStoreConfig.setFactoryImplementation((MapStoreFactory) (mapName, properties) -> new IPFSCryptoPersistor());
-
-        // -- IMPORTANT --
-        // We must create a map config for all data that we want to be persistent outside
-        // of the default data persistence.. This will custom maps to be persisted.
-        nbDataMapConfig.setMapStoreConfig(mapStoreConfig);
-
-        // Let's add a hook to tell jsync.io to update the hazelcast config
-        cluster.manager().addConfigHandler(hazelcastConfig -> {
-            logger.info("Storing latest Hazelcast IMap configuration for \"nbdata\".");
-            hazelcastConfig.addMapConfig(nbDataMapConfig);
+        mapStoreConfig.setFactoryImplementation(new MapStoreFactory() {
+            @Override
+            public MapLoader newMapStore(String mapName, Properties properties) {
+                return new IPFSCryptoPersistor();
+            }
         });
 
-        logger.info("Adding base services.");
+        nbDataMapConfig.setMapStoreConfig(mapStoreConfig);
 
-        cluster.addService(new NBDataPreloadService());
+        cluster.manager().addConfigHandler(hazelcastConfig -> {
+            logger.info("Storing latest Hazelcast IMap configuration for \"nbdata\"...");
+            hazelcastConfig.addMapConfig(nbDataMapConfig);
+        });
+        nbDataMapConfig.setMapStoreConfig(mapStoreConfig);
+        // -- IMPORTANT --
 
-        boolean enabelSockJS = rawConfig.getBoolean("enable_sockjs");
+        // This just ensures that the "nbdata" map is loaded.
+        cluster.addService(new ClusterService() {
+            private boolean started = false;
 
-        cluster.addService(new SockJSAPIService());
+            @Override
+            public void start(Cluster owner) {
+                started = true;
 
+                Logger logger = owner.logger();
+
+                logger.info("Ensuring the map \"nbdata\" can be preloaded.");
+
+                // This represents the data we store in this nebulosus keyvalue store
+                IMap<String, String> nbdata = owner.data().getMap("nbdata",false);
+
+                logger.info("Finished loading the map \"nbdata\" with " + nbdata.size() + " keys.");
+
+                nbdata.put("hello", "world");
+
+                assert nbdata.get("hello").equals("world");
+
+            }
+
+            @Override
+            public void stop() {
+                started = false;
+            }
+
+            @Override
+            public boolean running() {
+                return started;
+            }
+
+            @Override
+            public String name() {
+                return "PreLoadService";
+            }
+        });
+
+        boolean enableSockJS = jsonConfig.getBoolean("enable_sockjs", true);
+        if(enableSockJS){
+            cluster.addService(new SockJSAPIService());
+        }
+
+        EVAPPeerService evapPeerService = new EVAPPeerService();
+
+        cluster.addService(evapPeerService);
     }
 
     public static void main(String[] args){
-        NebulosusServer nebulosusServer = new NebulosusServer();
-
-        ClusterApp.initialize(nebulosusServer, "--join");
+        List<String> arguments = new LinkedList<>(Arrays.asList(args));
+        arguments.add("--join");
+        ClusterApp.initialize(new NebulosusServer(), arguments.toArray(new String[arguments.size()]));
     }
 }
