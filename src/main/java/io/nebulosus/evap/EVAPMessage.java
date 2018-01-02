@@ -12,8 +12,12 @@ public class EVAPMessage {
      */
     final public static int PROTOCOL_VERSION = 201701;
 
+    // TODO implement reply peer.
+
     private Buffer payload = null;
     private Buffer data = null;
+
+    private String token = null;
 
     private String payloadPeer = null;
     private PayloadType payloadType = null;
@@ -24,6 +28,13 @@ public class EVAPMessage {
 
         this.payloadPeer = _getPayloadPeer();
         this.payloadType = _getPayloadType();
+
+        this.token = payload.getString(12, 12 + payload.getInt(8));
+
+    }
+
+    public String getMessageToken(){
+        return token;
     }
 
     /**
@@ -89,7 +100,7 @@ public class EVAPMessage {
      */
     public enum PayloadType {
         /**
-         * The default payload type.
+         * The default payload type. In reality anything could be sent along with this.
          */
         DEFAULT(100),
         /**
@@ -97,9 +108,13 @@ public class EVAPMessage {
          */
         ACK(101),
         /**
-         * Represents a request to pin a specific IPFS hash.
+         * Represents a request to pin a specific hash.
          */
         PIN_DATA(1001),
+        /**
+         * Represents a request to unpin a specific hash.
+         */
+        UNPIN_DATA(1001),
         /**
          * Represents a broadcast message sent out by a relay peer.
          */
