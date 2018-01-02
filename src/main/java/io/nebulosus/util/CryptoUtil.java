@@ -18,8 +18,8 @@ import java.security.spec.X509EncodedKeySpec;
 import java.util.Random;
 
 /**
- * This is just a simple utility class providing some crypto features used throughout Nebulosus and the evaporation
- * protocol.
+ * This is just a simple utility class providing some crypto features used throughout Nebulosus and the Evaporation
+ * Protocol.
  */
 public class CryptoUtil {
 
@@ -39,7 +39,7 @@ public class CryptoUtil {
     }
 
     /**
-     * This will generate a very strong and secure password.
+     * This will generate a very strong and secure password. This really isn't all that secure..
      *
      * @return returns a randomly generated SHA512 string
      */
@@ -163,24 +163,57 @@ public class CryptoUtil {
         }
     }
 
+    /**
+     * This will decrypt a Buffer using a specified RSA PrivateKey.
+     *
+     * @param privateKey the private key you wish to use
+     * @param data the data you wish to decrypt
+     * @return the decrypted data
+     */
     public static Buffer decryptRSA(PrivateKey privateKey, Buffer data) {
         try {
             final Cipher cipher = Cipher.getInstance("RSA");
 
             // decrypt the text using the private key
             cipher.init(Cipher.DECRYPT_MODE, privateKey);
-            return new Buffer(cipher.doFinal(data.getBytes()));
+
+            Buffer curBuffer = new Buffer();
+            curBuffer.appendBuffer(data);
+            int bytesRead = 0;
+            do {
+                int len = (curBuffer.length() > 1024 ? bytesRead + 1024 : curBuffer.length());
+                cipher.update(curBuffer.getBytes(bytesRead, len));
+                bytesRead += len;
+            } while (bytesRead < curBuffer.length());
+
+            return new Buffer(cipher.doFinal());
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
 
+    /**
+     * This will encrypt a Buffer using a specified RSA PublicKey.
+     *
+     * @param publicKey the public key you wish to use
+     * @param data the data you wish to encrypt
+     * @return the encrypted data
+     */
     public static Buffer encryptRSA(PublicKey publicKey, Buffer data) {
         try {
             final Cipher cipher = Cipher.getInstance("RSA");
             // encrypt the plain text using the public key
             cipher.init(Cipher.ENCRYPT_MODE, publicKey);
-            byte[] encrypted = cipher.doFinal(data.getBytes());
+            Buffer curBuffer = new Buffer();
+            curBuffer.appendBuffer(data);
+            int bytesRead = 0;
+            do {
+                int len = (curBuffer.length() > 1024 ? bytesRead + 1024 : curBuffer.length());
+                cipher.update(curBuffer.getBytes(bytesRead, len));
+                bytesRead += len;
+            } while (bytesRead < curBuffer.length());
+
+            byte[] encrypted = cipher.doFinal();
             return new Buffer(encrypted);
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -200,18 +233,36 @@ public class CryptoUtil {
 
     public static Buffer signRSA(Buffer data, PrivateKey privateKey) {
         try {
-            Signature privateSignature = Signature.getInstance("SHA512withRSA");
-            privateSignature.initSign(privateKey);
+            Signature signature = Signature.getInstance("SHA512withRSA");
+            signature.initSign(privateKey);
             Buffer curBuffer = new Buffer();
             curBuffer.appendBuffer(data);
             int bytesRead = 0;
             do {
                 int len = (curBuffer.length() > 1024 ? bytesRead + 1024 : curBuffer.length());
-                privateSignature.update(curBuffer.getBytes(bytesRead, len));
+                signature.update(curBuffer.getBytes(bytesRead, len));
                 bytesRead += len;
             } while (bytesRead < curBuffer.length());
-            byte[] signature = privateSignature.sign();
-            return new Buffer(signature);
+            byte[] signatureData = signature.sign();
+            return new Buffer(signatureData);
+        } catch (Exception e){
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static boolean verifyRSA(Buffer signatureData, Buffer data, PublicKey publicKey) {
+        try {
+            Signature signature = Signature.getInstance("SHA512withRSA");
+            signature.initVerify(publicKey);
+            Buffer curBuffer = new Buffer();
+            curBuffer.appendBuffer(data);
+            int bytesRead = 0;
+            do {
+                int len = (curBuffer.length() > 1024 ? bytesRead + 1024 : curBuffer.length());
+                signature.update(curBuffer.getBytes(bytesRead, len));
+                bytesRead += len;
+            } while (bytesRead < curBuffer.length());
+            return signature.verify(signatureData.getBytes());
         } catch (Exception e){
             throw new RuntimeException(e);
         }

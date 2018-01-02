@@ -1,5 +1,7 @@
 package io.nebulosus.evap;
 
+import com.hazelcast.core.ILock;
+import com.hazelcast.core.IMap;
 import io.ipfs.api.IPFS;
 import io.ipfs.api.MerkleNode;
 import io.ipfs.api.NamedStreamable;
@@ -31,15 +33,18 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 import static io.jsync.utils.CryptoUtils.calculateSHA1;
 import static io.nebulosus.util.CryptoUtil.*;
 
 /**
- * The EVAPPeerService makes it as simple as possible to implement the Evaporation Protocol within a
- * jsync.io based application.
+ * The EVAPPeerService is a jsync.io ClusterService that provides a simple interface to the Evaporation Protocol. This makes
+ * it very easy to stand up an EVAP peer.
  */
 public class EVAPPeerService implements ClusterService {
 
@@ -47,14 +52,12 @@ public class EVAPPeerService implements ClusterService {
      * This is a default list of bootstrap nodes that help facilitate communications within the evaporation network.
      * The IP addresses are hardcoded for now but may not be needed in the future. The Evaporation Network utilizes
      * these bootstrap nodes to help facilitate communications within the network.
-     *
+     * <p>
      * (Yes I do run these nodes. Please do not attack them. - Tony Rice)
      */
     final public String[] DEFAULT_BOOTSTRAP_LIST = new String[]{
             "/ip4/51.254.18.68/tcp/4001/ipfs/QmdfahxLMqymEDEjXVYXTgtezJAtxL8L45pjfqncUu7786",
-            "/ip4/51.254.18.69/tcp/4001/ipfs/QmPozFEzrwvy5BRM68rDbcZw6FPTYi9XA1cg1chiwPgA13",
-            "/ip4/51.254.18.70/tcp/4001/ipfs/QmbEKxRycKnu6sNpTcKirCuF8McasLwoZSboLVbm1b31RN",
-            "/ip4/51.254.18.71/tcp/4001/ipfs/QmSi3BPyVwZ6PKBQSZrtjFaH435f6Dmrmnw1g328icZ9fn"
+            "/ip4/51.254.18.69/tcp/4001/ipfs/QmPozFEzrwvy5BRM68rDbcZw6FPTYi9XA1cg1chiwPgA13"
     };
 
     private static EVAPPeerService localService = null;
@@ -64,7 +67,7 @@ public class EVAPPeerService implements ClusterService {
         startupHandlers.forEach(handler -> {
             try {
                 handler.handle(localService);
-            } catch (Exception e){
+            } catch (Exception e) {
                 localService.logger.error("Handler Error!", e);
             }
         });
@@ -80,8 +83,8 @@ public class EVAPPeerService implements ClusterService {
     public static void ready(Handler<EVAPPeerService> handler) {
         if (localService != null && localService.started) {
             try {
-                handler.handle(null);
-            } catch (Exception e){
+                handler.handle(localService);
+            } catch (Exception e) {
                 localService.logger.error("Handler Error!", e);
             }
             return;
@@ -92,14 +95,14 @@ public class EVAPPeerService implements ClusterService {
     /**
      * @return returns true if the local EVAPPeerService has been started
      */
-    public static boolean ready(){
+    public static boolean ready() {
         return localService != null && localService.started;
     }
 
     /**
      * @return returns the current EVAPPeerService instance
      */
-    public static EVAPPeerService getLocalService(){
+    public static EVAPPeerService getLocalService() {
         return localService;
     }
 
@@ -122,14 +125,19 @@ public class EVAPPeerService implements ClusterService {
 
     private Set<String> trustedPeers = new ConcurrentHashSet<>();
 
+    private Map<String, byte[]> cachedPublicKeyData = new ConcurrentHashMap<>();
+
+    private IMap<String, Long> handledMessages = null;
+
     // This will store a list of peers. For example if you trust the Cirrostratus network you are trusting
     // paid peers routed through the network
     private Map<String, Date> localPeerTable = new ConcurrentHashMap<>();
     private Map<String, Handler<AsyncResult<Void>>> ackResponseHandlers = new ConcurrentHashMap<>();
 
-    private Handler<EVAPMessage> messageHandler = null;
+    private Set<Handler<AsyncResult<EVAPMessage>>> messageHandlers = new ConcurrentHashSet<>();
 
-    private boolean multiLayerSupportEnabled = true;
+    private boolean relayNode = false;
+    private boolean multiLayerSupportEnabled = false;
 
     private boolean started = false;
 
@@ -146,6 +154,8 @@ public class EVAPPeerService implements ClusterService {
         this.localAsync = owner.async();
 
         EVAPPeerService.localService = this;
+
+        this.handledMessages = cluster.data().getMap("pevaphmsgs");
 
         // We really don't need a huge pool of IPFS clients. This is more
         // or less so we can ensure IPFS is started locally.
@@ -172,6 +182,9 @@ public class EVAPPeerService implements ClusterService {
             logger.error("Failed to add default bootstrap nodes.", e);
         }
 
+        // TODO enable open relay peers. These peers are generally not trusted and can easily be manipulated.
+        // Only utilize this if you know what you are doing
+
         // Let's initialize this! We can't utilize EVAP
         // with out pubsub or IPFS.
         pubsub = new AsyncPubSub(ipfs);
@@ -183,10 +196,20 @@ public class EVAPPeerService implements ClusterService {
         boolean enabled = evapServiceConfig.getBoolean("enabled", true);
 
         // This means this node will relay messages!
-        boolean relayNode = evapServiceConfig.getBoolean("relay_node", false);
+        relayNode = evapServiceConfig.getBoolean("relay_node", false);
 
         String peerKeyPassword = evapServiceConfig.getString("key_password", "CHANGEME!!!!");
 
+        boolean waitForPeers = evapServiceConfig.getBoolean("wait_for_peers", false);
+
+        int minPeerCount = evapServiceConfig.getInteger("min_peer_count", 1);
+
+        evapServiceConfig.putBoolean("relay_node", relayNode);
+
+        evapServiceConfig.putBoolean("wait_for_peers", waitForPeers);
+        evapServiceConfig.putNumber("min_peer_count", minPeerCount);
+
+        evapServiceConfig.putBoolean("relay_node", relayNode);
         evapServiceConfig.putBoolean("enabled", enabled);
 
         Object[] _trustedPeers = evapServiceConfig.getArray("trusted_peers", new JsonArray()).toArray();
@@ -313,6 +336,12 @@ public class EVAPPeerService implements ClusterService {
             // This will simply be a sha1 hash of the public key
             String peerAddr = calculateSHA1(publicKey.getEncoded());
 
+            // Let's go ahead and subscribe to messages for this peer.
+            // NOTE: One might consider this a security hole. You can easily find the peers
+            // based on their public key.... that's the point though. The data is encrypted and nobody
+            // has any idea what is being sent. It could be a relay message, or really anything. The NSA could easily
+            // detect which peers are communicating with what. You also don't generally want to announce your public keys
+            // to anybody. BUT!!!!!! EVAP supports chained public keys. A
             pubsub.sub(peerAddr, event -> {
                 Buffer data;
                 try {
@@ -321,70 +350,124 @@ public class EVAPPeerService implements ClusterService {
                     data = new Buffer(new String(event.getBinary("data", new byte[0])));
                 }
 
-                validateMessage(data, message -> {
+                // TODO ignore messages already received from previous servers.
+
+                validateMessage(data, asyncResult -> {
                     try {
 
-                        Buffer payload = message.getPayload();
+                        EVAPMessage message = asyncResult.result();
 
-                        Buffer decrypted = message.getData();
+                        // This means this message was handled already by this cluster.
+                        if (handledMessages.containsKey(message.getMessageToken())) {
+                            logger.info("Ignoring already handled message \"" + message.getMessageToken() + "\".");
+                            return;
+                        }
 
-                        EVAPMessage.PayloadType payloadType = message.getPayloadType();
+                        ILock messageLock = cluster.hazelcast().getLock("evap.msg.lock." + message.getMessageToken());
 
-                        // Begin payload preprocessing.
+                        if (messageLock.tryLock()) {
+                            try {
+                                Buffer decrypted = message.getData();
 
-                        if(message.getPayloadType() == EVAPMessage.PayloadType.ACK){
-                            int hashLen = decrypted.getInt(0);
-                            String hash = decrypted.getString(4, hashLen + 4);
-                            if (ackResponseHandlers.containsKey(hash)) {
-                                localAsync.runOnContext(event1 -> ackResponseHandlers.remove(hash).handle(new DefaultFutureResult<Void>().setResult(null)));
-                            }
-                        } else if (payloadType == EVAPMessage.PayloadType.PEER_RELAY_BROADCAST) {
-                            int peerHashLen = decrypted.getInt(0);
-                            String peerHash = decrypted.getString(4, peerHashLen + 4);
+                                EVAPMessage.PayloadType payloadType = message.getPayloadType();
 
-                            if (trustedPeers.contains(peerHash)) {
-                                if (!localPeerTable.containsKey(peerHash)) {
-                                    logger.info("Adding new relay peer to local peer table \"" + peerHash + "\".");
-                                }
+                                // Begin payload preprocessing.
 
-                                localPeerTable.put(peerHash, new Date());
-                            } else {
-                                String payloadPeerHash = message.getPayloadPeer();
-                                if (trustedPeers.contains(payloadPeerHash)) {
-                                    if (!localPeerTable.containsKey(peerHash)) {
-                                        logger.info("Adding new relay peer to local peer table \"" + peerHash + "\" from trusted peer \"" + payloadPeerHash + "\".");
+                                if (message.getPayloadType() == EVAPMessage.PayloadType.ACK) {
+                                    int hashLen = decrypted.getInt(0);
+                                    String hash = decrypted.getString(4, hashLen + 4);
+                                    if (ackResponseHandlers.containsKey(hash)) {
+                                        localAsync.runOnContext(event1 -> ackResponseHandlers.remove(hash).handle(new DefaultFutureResult<Void>().setResult(null)));
                                     }
-                                    localPeerTable.put(peerHash, new Date());
+                                } else if (payloadType == EVAPMessage.PayloadType.PEER_RELAY_BROADCAST) {
+                                    int peerHashLen = decrypted.getInt(0);
+                                    String peerHash = decrypted.getString(4, peerHashLen + 4);
+
+                                    if (trustedPeers.contains(peerHash)) {
+                                        if (!localPeerTable.containsKey(peerHash)) {
+                                            logger.info("Adding new relay peer to local peer table \"" + peerHash + "\".");
+                                        }
+
+                                        Calendar calendar = Calendar.getInstance();
+                                        calendar.add(Calendar.MINUTE, 3);
+                                        localPeerTable.put(peerHash, calendar.getTime());
+                                    } else {
+                                        String payloadPeerHash = message.getPayloadPeer();
+                                        if (trustedPeers.contains(payloadPeerHash)) {
+                                            if (!localPeerTable.containsKey(peerHash)) {
+                                                logger.info("Adding new relay peer to local peer table \"" + peerHash + "\" from trusted peer \"" + payloadPeerHash + "\".");
+                                            }
+                                            Calendar calendar = Calendar.getInstance();
+                                            calendar.add(Calendar.MINUTE, 3);
+                                            localPeerTable.put(peerHash, calendar.getTime());
+                                        }
+                                    }
+                                } else if (payloadType == EVAPMessage.PayloadType.PEER_LOG) {
+                                    // This represents a log message from a trusted peer. If a peer is not trusted, all messages
+                                    // will be discarded.
+
+                                    String payloadPeerHash = message.getPayloadPeer();
+
+                                    if (trustedPeers.contains(payloadPeerHash) || payloadPeerHash.equals(peerKeyHash)) {
+                                        logger.info("EVAP Log (" + payloadPeerHash + "): " + decrypted);
+                                    }
+                                } else if (payloadType == EVAPMessage.PayloadType.MESSAGE_RELAY && relayNode) {
+                                    String payloadPeerHash = message.getPayloadPeer();
+                                    if (trustedPeers.contains(payloadPeerHash) || payloadPeerHash.equals(peerKeyHash)) {
+                                        int relayPeerAddrLen = decrypted.getInt(0);
+                                        String relayPeerAddr = decrypted.getString(4, 4 + relayPeerAddrLen);
+
+                                        int messageDataLen = decrypted.getInt(4 + relayPeerAddrLen);
+                                        Buffer messageData = decrypted.getBuffer(8 + relayPeerAddrLen, 8 + relayPeerAddrLen + messageDataLen);
+
+                                        // This means there is no signature. So why the hell don't we sign it???
+                                        // We trust the peer relaying it anyway and we are relaying the message.
+                                        if(messageData.length() == messageData.getInt(0) + 4){
+                                            Buffer encryptedData = messageData.getBuffer(4,
+                                                    messageData.getInt(0) + 4);
+
+                                            Buffer signature = CryptoUtil.signRSA(encryptedData, privateKey);
+
+                                            Buffer newMessage = new Buffer();
+                                            newMessage.appendInt(encryptedData.length());
+                                            newMessage.appendBuffer(encryptedData);
+
+                                            newMessage.appendInt(signature.length());
+                                            newMessage.appendBuffer(signature);
+
+                                            System.out.println(signature);
+
+                                            broadcastMessage(relayPeerAddr, newMessage);
+                                            return;
+                                        }
+                                        broadcastMessage(relayPeerAddr, messageData);
+                                    }
                                 }
-                            }
-                        } else if (payloadType == EVAPMessage.PayloadType.PEER_LOG) {
-                            // This represents a log message from a trusted peer. If a peer is not trusted, all messages
-                            // will be discarded.
 
-                            String payloadPeerHash = message.getPayloadPeer();
+                                // End payload preprocessing
 
-                            if (trustedPeers.contains(payloadPeerHash) || payloadPeerHash.equals(peerKeyHash)) {
-                                logger.info("EVAP Log (" + payloadPeerHash + "): " + decrypted);
-                            }
-                        } else if(payloadType == EVAPMessage.PayloadType.MESSAGE_RELAY && relayNode){
-                            String payloadPeerHash = message.getPayloadPeer();
-                            if(trustedPeers.contains(payloadPeerHash) || payloadPeerHash.equals(peerKeyHash)){
-                                int relayPeerAddrLen = decrypted.getInt(0);
-                                String relayPeerAddr = decrypted.getString(4, 4 + relayPeerAddrLen);
-
-                                int relayDataLen = decrypted.getInt(4 + relayPeerAddrLen);
-                                Buffer relayData = decrypted.getBuffer(8 + relayPeerAddrLen, 8 + relayPeerAddrLen + relayDataLen);
-                                broadcastMessage(relayPeerAddr, relayData);
+                                messageHandlers.forEach(handler -> localAsync.runOnContext(event12 -> handler.handle(new DefaultFutureResult<>(message))));
+                            } finally {
+                                handledMessages.put(message.getMessageToken(), new Date().getTime());
+                                messageLock.unlock();
                             }
                         }
 
-                        // End payload preprocessing
-
-                        if(messageHandler != null){
-                            messageHandler.handle(new EVAPMessage(payload, decrypted));
-                        }
                     } catch (Exception e) {
                         logger.error("Error Occurred!", e);
+                    }
+                });
+            });
+
+            localAsync.setPeriodic(2500, event -> {
+                if(!started){
+                    localAsync.cancelTimer(event);
+                    return;
+                }
+
+                localPeerTable.forEach((peer, date) -> {
+                    if((new Date()).after(date)){
+                        localPeerTable.remove(peer);
                     }
                 });
             });
@@ -405,7 +488,11 @@ public class EVAPPeerService implements ClusterService {
 
                 Runnable broadcastRelayNode = () -> {
                     try {
-                        trustedPeers.forEach(peerKeyHash -> constructPeerMessage(EVAPPeerService.this.peerKeyHash, getPublicKey(peerKeyHash), EVAPMessage.PayloadType.PEER_RELAY_BROADCAST.code, relayMsg, EVAPPeerService.this::broadcastMessage));
+                        trustedPeers.forEach(peerKeyHash -> constructPeerMessage(EVAPPeerService.this.peerKeyHash, getPublicKey(peerKeyHash),
+                                EVAPMessage.PayloadType.PEER_RELAY_BROADCAST.code, relayMsg, event -> broadcastMessage(event.result().getKey(), event.result().getValue())));
+
+                        // TODO setup broadcast globally.
+
                     } catch (Exception e) {
                         logger.error("Relay Broadcast Error", e);
                     }
@@ -427,6 +514,30 @@ public class EVAPPeerService implements ClusterService {
             config.rawConfig().putObject("evap", evapServiceConfig);
             config.save();
 
+            // TODO Discover peers...
+
+            // This might be very useful.
+
+            if (waitForPeers) {
+                // TODO do this.
+                CountDownLatch waitLatch = new CountDownLatch(1);
+
+                logger.info("Waiting for peers...");
+
+                long waitTimer = localAsync.setPeriodic(750, event -> {
+                    if (localPeerTable.size() > 0) {
+                        logger.info("A peer has been found!");
+                        waitLatch.countDown();
+                    }
+                });
+
+                // We will wait at most 60 seconds.
+                waitLatch.await(60, TimeUnit.SECONDS);
+
+                localAsync.cancelTimer(waitTimer);
+            }
+
+
         } catch (Exception e) {
             logger.error("EVAPPeerService error!", e);
         } finally {
@@ -442,20 +553,22 @@ public class EVAPPeerService implements ClusterService {
     }
 
     /**
-     * This allows you to simply publish a message destined for a specific peer.
+     * This allows you to publish a defai;t message destined for a specific peer.
      *
-     * @param peerHash the peer you wish to send the message to
-     * @param data the data you wish to publish
+     * @param peerHash the peer you wish to receive the message
+     * @param data     the data you wish to publish
      * @return returns an instance of this
      */
-    public EVAPPeerService publish(String peerHash, Buffer data){
+    public EVAPPeerService publish(String peerHash, Buffer data) {
         checkStarted();
         try {
             byte[] peerPublicKeyData = getPublicKey(peerHash);
-            if(multiLayerSupportEnabled){
-                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data, this::broadcastMessage);
+            if (multiLayerSupportEnabled) {
+                constructMultiLayerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data,
+                        event -> broadcastMessage(event.result().getKey(), event.result().getValue()));
             } else {
-                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data, this::broadcastMessage);
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.DEFAULT.code, data,
+                        event -> broadcastMessage(event.result().getKey(), event.result().getValue()));
             }
         } catch (Exception e) {
             logger.error("Error Occurred", e);
@@ -463,9 +576,27 @@ public class EVAPPeerService implements ClusterService {
         return this;
     }
 
+    private void checkConfigurable(){
+        if(started){
+            throw new RuntimeException("It loos like the service has already been started!");
+        }
+    }
+
+    public EVAPPeerService multiLayerSupportEnabled(boolean enabled){
+        checkConfigurable();
+        this.multiLayerSupportEnabled = enabled;
+        return this;
+    }
+
+    public EVAPPeerService relayNode(boolean relayNode){
+        checkConfigurable();
+        this.relayNode = relayNode;
+        return this;
+    }
+
     /**
-     * This allows you to broadcast a log message to a specified peer. Generally
-     * a peer will only display a message from a trusted peer.
+     * This allows you to publish a long message destined for a specific peer. This does not guarantee, the peer will receive
+     * the message.
      *
      * @param peerHash the peer you wish to send the log to
      * @param message  the actual log message
@@ -476,10 +607,12 @@ public class EVAPPeerService implements ClusterService {
 
         try {
             byte[] peerPublicKeyData = getPublicKey(peerHash);
-            if(multiLayerSupportEnabled){
-                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message), this::broadcastMessage);
+            if (multiLayerSupportEnabled) {
+                constructMultiLayerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message),
+                        event -> broadcastMessage(event.result().getKey(), event.result().getValue()));
             } else {
-                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message), this::broadcastMessage);
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PEER_LOG.code, new Buffer(message),
+                        event -> broadcastMessage(event.result().getKey(), event.result().getValue()));
             }
         } catch (Exception e) {
             logger.error("Error Occurred", e);
@@ -488,28 +621,24 @@ public class EVAPPeerService implements ClusterService {
         return this;
     }
 
-    public EVAPPeerService addTrustedPeer(String peerHash) {
-        trustedPeers.add(peerHash);
-        return this;
+    public EVAPPeerService pin(String peerKeyHash, Multihash multihash){
+        return pin(peerKeyHash, -1, multihash, null);
     }
 
-    public EVAPPeerService removeTrustedPeer(String peerHash) {
-        trustedPeers.remove(peerHash);
-        return this;
-    }
-
-    public Set<String> trustedPeers() {
-        return new LinkedHashSet<>(trustedPeers);
+    public EVAPPeerService pin(String peerKeyHash, long expiresInMilliseconds, Multihash multihash){
+        return pin(peerKeyHash, expiresInMilliseconds, multihash, null);
     }
 
     /**
-     * This will attempt to request that a specific peer ensures the persistence of a specific piece of data.
+     * This will attempt to publish a pin request for a specific MultiHash. This does not guarantee the specified
+     * IPFS data will be persisted. This is generally utilized to facilitate p2p data transfer utilizing IPFS. By utilizing
+     * the Evaporation Protocol, many peers can be easily utilized to persist your data.
      *
      * @param peerHash   the peer you wish to persist the data
      * @param multihash  the Multihash for the data you wish to persist
      * @param ackHandler a handler that is trigger when an acknowledgement is received
      */
-    public EVAPPeerService persist(String peerHash, Multihash multihash, Handler<AsyncResult<Void>> ackHandler) {
+    public EVAPPeerService pin(String peerHash, long expiresInMilliseconds, Multihash multihash, Handler<AsyncResult<Void>> ackHandler) {
         checkStarted();
 
         try {
@@ -519,29 +648,26 @@ public class EVAPPeerService implements ClusterService {
             // Let's store thy hash.
             String hash = multihash.toString();
 
-            logger.info("Attempting to persist the data located at \"" + hash + "\'.");
-
             buffer.appendInt(hash.length());
             buffer.appendString(hash);
+
+            buffer.appendLong(expiresInMilliseconds);
 
             byte[] peerPublicKeyData = getPublicKey(peerHash);
 
             Runnable[] broadcastMessage = new Runnable[1];
 
-            if(multiLayerSupportEnabled){
-                if(ackHandler != null){
+            if (multiLayerSupportEnabled) {
+                if (ackHandler != null) {
                     logger.warn("ACK responses are not currently supported by multilayer messages. This will be supported soon!");
                 }
-                constructMultiLayerMessage(peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, new BiConsumer<String, Buffer>() {
-                    @Override
-                    public void accept(String peerAddress, Buffer peerMessage) {
-                        broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
-                        broadcastMessage[0].run();
-                    }
+                constructMultiLayerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, event -> {
+                    broadcastMessage[0] = () -> broadcastMessage(event.result().getKey(), event.result().getValue());
+                    broadcastMessage[0].run();
                 });
             } else {
-                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, (peerAddress, peerMessage) -> {
-                    broadcastMessage[0] = () -> broadcastMessage(peerAddress, peerMessage);
+                constructPeerMessage(peerKeyHash, peerPublicKeyData, EVAPMessage.PayloadType.PIN_DATA.code, buffer, event -> {
+                    broadcastMessage[0] = () -> broadcastMessage(event.result().getKey(), event.result().getValue());
                     broadcastMessage[0].run();
                 }, event -> {
                     if (event.failed()) {
@@ -560,94 +686,135 @@ public class EVAPPeerService implements ClusterService {
         return this;
     }
 
-    public EVAPPeerService messageHandler(Handler<EVAPMessage> handler){
-        this.messageHandler = handler;
+    /**
+     * This will add a peer to your trusted peer list.
+     * @param peerHash the peer you wish to trust
+     */
+    public EVAPPeerService addTrustedPeer(String peerHash) {
+        trustedPeers.add(peerHash);
         return this;
     }
 
-    private void validateMessage(Buffer data, Handler<EVAPMessage> payloadHandler) {
-        validateMessage(false, data, payloadHandler);
+    /**
+     * This will remove a trusted peer from the trusted peer list.
+     * @param peerHash the peer you no longer wish to trust.
+     */
+    public EVAPPeerService removeTrustedPeer(String peerHash) {
+        trustedPeers.remove(peerHash);
+        return this;
     }
 
-    private void validateMessage(boolean requireTrusted, Buffer bufferData, Handler<EVAPMessage> payloadHandler) {
+    /**
+     * This will go ahead and return a collection of your trusted peers.
+     * @return a collection of trusted peers.
+     */
+    public Collection<String> trustedPeers() {
+        return new LinkedHashSet<>(trustedPeers);
+    }
 
-        int dataLen = bufferData.getInt(0);
+    /**
+     * This allows you to handle an EVAP message.
+     * @param handler
+     * @return
+     */
+    public EVAPPeerService handleMessage(Handler<AsyncResult<EVAPMessage>> handler) {
+        messageHandlers.add(handler);
+        return this;
+    }
 
-        Buffer data = bufferData.getBuffer(4, dataLen + 4);
+    private void validateMessage(Buffer bufferData, Handler<AsyncResult<EVAPMessage>> payloadHandler) {
+        localAsync.executeBlocking(() -> {
 
-        int hashLen = data.getInt(0);
+            int dataLen = bufferData.getInt(0);
 
-        String msgHash = data.getString(4, hashLen + 4);
+            Buffer data = bufferData.getBuffer(4, dataLen + 4);
 
-        int payloadLen = data.getInt(hashLen + 4);
+            int hashLen = data.getInt(0);
 
-        Buffer encryptedPayload = data.getBuffer(hashLen + 8, hashLen + payloadLen + 8);
+            String msgHash = data.getString(4, hashLen + 4);
 
-        Buffer payload = CryptoUtil.decryptRSA(privateKey, encryptedPayload);
+            int payloadLen = data.getInt(hashLen + 4);
 
-        int msgTokenLen = payload.getInt(8);
+            Buffer encryptedPayload = data.getBuffer(hashLen + 8, hashLen + payloadLen + 8);
 
-        // This helps identify a message - Technically a message can be sent out
-        // through many different routes. This provides a reference so we can know we
-        // already received the message - TODO
-        String msgToken = payload.getString(12, 12 + msgTokenLen);
+            Buffer payload = CryptoUtil.decryptRSA(privateKey, encryptedPayload);
 
-        int cryptoKeyLen = payload.getInt(12 + msgTokenLen);
+            int msgTokenLen = payload.getInt(8);
 
-        String cryptoKey = payload.getString(16 + msgTokenLen, 16 + msgTokenLen + cryptoKeyLen);
+            int cryptoKeyLen = payload.getInt(12 + msgTokenLen);
 
-        int saltLen = payload.getInt(16 + msgTokenLen + cryptoKeyLen);
+            String cryptoKey = payload.getString(16 + msgTokenLen, 16 + msgTokenLen + cryptoKeyLen);
 
-        byte[] salt = payload.getBytes(20 + msgTokenLen + cryptoKeyLen, 20 + msgTokenLen + cryptoKeyLen + saltLen);
+            int saltLen = payload.getInt(16 + msgTokenLen + cryptoKeyLen);
 
-        SecretKey secretKey = generateSecretKey(cryptoKey, salt);
+            byte[] salt = payload.getBytes(20 + msgTokenLen + cryptoKeyLen, 20 + msgTokenLen + cryptoKeyLen + saltLen);
 
-        int cryptoLen = data.getInt(hashLen + payloadLen + 8);
+            SecretKey secretKey = generateSecretKey(cryptoKey, salt);
 
-        Buffer cryptoData = data.getBuffer(hashLen + payloadLen + 12, hashLen + payloadLen + cryptoLen + 12);
-        Buffer decryptedData = decrypt(secretKey, cryptoData);
+            int cryptoLen = data.getInt(hashLen + payloadLen + 8);
 
-        int messageLen = decryptedData.getInt(0);
-        Buffer messageData = decryptedData.getBuffer(4, 4 + messageLen);
+            Buffer cryptoData = data.getBuffer(hashLen + payloadLen + 12, hashLen + payloadLen + cryptoLen + 12);
 
-        // Does this message require an acknowledgement???
-        boolean requiresAck = decryptedData.length() > (4 + messageLen) && payload.getByte(payload.length() - 1) == (byte) 10;
-        if (requiresAck) {
-            // Yes ??? Okay let's verify the decrypted data is an ack message.
-            if (decryptedData.getInt(4 + messageLen) == EVAPMessage.PayloadType.ACK.code) {
-                int ackPayloadLen = decryptedData.getInt(8 + messageLen);
-                Buffer ackPayload = decryptedData.getBuffer(12 + messageLen, 12 + messageLen + ackPayloadLen);
+            Buffer decryptedData = decrypt(secretKey, cryptoData);
 
-                int ackReplyAddressLen = ackPayload.getInt(0);
-                String ackReplyAddress = ackPayload.getString(4, 4 + ackReplyAddressLen);
+            int messageLen = decryptedData.getInt(0);
+            Buffer messageData = decryptedData.getBuffer(4, 4 + messageLen);
 
-                int ackReplyDataLen = ackPayload.getInt(4 + ackReplyAddressLen);
-                Buffer ackReplyData = ackPayload.getBuffer(8 + ackReplyAddressLen, 8 + ackReplyAddressLen + ackReplyDataLen);
+            // Does this message require an acknowledgement???
+            boolean requiresAck = decryptedData.length() > (4 + messageLen) && payload.getByte(payload.length() - 1) == (byte) 10;
+            if (requiresAck) {
+                // Yes ??? Okay let's verify the decrypted data is an ack message.
+                if (decryptedData.getInt(4 + messageLen) == EVAPMessage.PayloadType.ACK.code) {
+                    int ackPayloadLen = decryptedData.getInt(8 + messageLen);
+                    Buffer ackPayload = decryptedData.getBuffer(12 + messageLen, 12 + messageLen + ackPayloadLen);
 
-                // Let's send the actual message!
-                broadcastMessage(ackReplyAddress, ackReplyData);
+                    int ackReplyAddressLen = ackPayload.getInt(0);
+                    String ackReplyAddress = ackPayload.getString(4, 4 + ackReplyAddressLen);
+
+                    int ackReplyDataLen = ackPayload.getInt(4 + ackReplyAddressLen);
+                    Buffer ackReplyData = ackPayload.getBuffer(8 + ackReplyAddressLen, 8 + ackReplyAddressLen + ackReplyDataLen);
+
+                    // Let's send the actual acknowledgement message!
+                    broadcastMessage(ackReplyAddress, ackReplyData);
+                }
             }
-        }
 
-        // Begin message verification.
-        Buffer calculatedHashData = new Buffer();
-        calculatedHashData.appendBytes(publicKey.getEncoded());
-        calculatedHashData.appendBuffer(payload);
-        calculatedHashData.appendBuffer(messageData);
+            // Begin message verification.
+            Buffer calculatedHashData = new Buffer();
+            calculatedHashData.appendBytes(publicKey.getEncoded());
+            calculatedHashData.appendBuffer(payload);
+            calculatedHashData.appendBuffer(messageData);
 
-        String calculatedMsgHash = CryptoUtils.calculateSHA512(calculatedHashData.getBytes());
+            String calculatedMsgHash = CryptoUtils.calculateSHA512(calculatedHashData.getBytes());
 
-        // TODO verify signed data -- Maybe not?? Is there signed data??
+            // TODO verify signed data -- Maybe not?? Is there signed data??
 
-        // this helps us verify the contents of the message. not so much who is actually sending it.
-        if (calculatedMsgHash.equals(msgHash)) {
-            if (payloadHandler != null) {
-                payloadHandler.handle(new EVAPMessage(payload, messageData));
+            // this helps us verify the contents of the message. not so much who is actually sending it.
+            if (calculatedMsgHash.equals(msgHash)) {
+
+                EVAPMessage message = new EVAPMessage(payload, messageData);
+
+                // This is not required. This is only utilized generally when a message is received to it's
+                // final destination.
+                if(data.length() > hashLen + payloadLen + cryptoLen + 12){
+                    int signatureLen = data.getInt(hashLen + payloadLen + cryptoLen + 12);
+                    byte[] signatureData = data.getBytes(hashLen + payloadLen + cryptoLen + 16, hashLen + payloadLen + cryptoLen + signatureLen + 16);
+                    String payloadPeer = message.getPayloadPeer();
+                    byte[] peerBytes = getPublicKey(payloadPeer);
+                    if(!CryptoUtil.verifyRSA(new Buffer(signatureData), cryptoData, generateRSAPublicKey(peerBytes))){
+                        throw new RuntimeException("Peer message signature verification failed");
+                    }
+                }
+
+                return message;
             }
-            return;
-        }
 
-        throw new RuntimeException("Invalid message!");
+            throw new RuntimeException("Message signature verification failed!");
+        }, event -> {
+            if(payloadHandler != null){
+                payloadHandler.handle(event);
+            }
+        });
     }
 
     private Buffer decryptData(Buffer data) {
@@ -673,12 +840,21 @@ public class EVAPPeerService implements ClusterService {
      * @return the raw byte array for the peers public key
      */
     private byte[] getPublicKey(String peerHash) {
+        if (cachedPublicKeyData.containsKey(peerHash)) {
+            return cachedPublicKeyData.get(peerHash);
+        }
+
         IPFSClientPool ipfsClientPool = IPFSClientPool.defaultInstance();
         IPFS ipfs = ipfsClientPool.get();
         try {
             byte[] peerPubKey = ipfs.cat(Multihash.fromBase58(peerHash));
             String data = new String(peerPubKey);
-            return Base64.decode(data);
+
+            byte[] decoded = Base64.decode(data);
+
+            cachedPublicKeyData.put(peerHash, decoded);
+
+            return decoded;
         } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
@@ -693,15 +869,17 @@ public class EVAPPeerService implements ClusterService {
         pubsub.pub(address, Base64.encodeBytes(message.getBytes()));
     }
 
-    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer){
-        constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, consumer, null, -1, null, -1);
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, Handler<AsyncResult<Map.Entry<String, Buffer>>> resultHandler) {
+        constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, resultHandler, null, -1, null, -1);
     }
 
-    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler){
-        constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, consumer, ackHandler, -1, null, 5);
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, Handler<AsyncResult<Map.Entry<String, Buffer>>> resultHandler, Handler<AsyncResult<Void>> ackHandler) {
+        constructPeerMessage(payloadPeer, peerPublicKeyData, msgType, message, resultHandler, ackHandler, -1, null, 5);
     }
 
-    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer, Handler<AsyncResult<Void>> ackHandler, long ackTimeout, TimeUnit ackTimeoutTimeUnit, int rebroadcastCount) {
+    private void constructPeerMessage(String payloadPeer, byte[] peerPublicKeyData, int msgType, Buffer message, Handler<AsyncResult<Map.Entry<String, Buffer>>> resultHandler, Handler<AsyncResult<Void>> ackHandler, long ackTimeout, TimeUnit ackTimeoutTimeUnit, int rebroadcastCount) {
+
+        boolean requiresAck = ackHandler != null;
 
         PublicKey peerKey = generateRSAPublicKey(peerPublicKeyData);
 
@@ -712,6 +890,7 @@ public class EVAPPeerService implements ClusterService {
         // Ensure the message type is added at the beginning of the payload
         payloadMessage.appendInt(msgType); // This essentially means that we want to pin some data on IPFS
 
+        // This is pointless
         String msgToken = Token.generateToken().toHex();
 
         payloadMessage.appendInt(msgToken.length());
@@ -729,121 +908,176 @@ public class EVAPPeerService implements ClusterService {
             payloadMessage.appendBytes(salt);
         });
 
-        // This is so we can verify the message! Todo this might not be the best idea or really secure at all.
+        // This consists of the actual recipient routing this message.
         payloadMessage.appendInt(payloadPeer.length());
         payloadMessage.appendString(payloadPeer);
 
-        // TODO handle acknowledgement data here.
-
-        boolean requiresAck = ackHandler != null;
+        // TODO handle acknowledgement data here
 
         if (requiresAck) {
             payloadMessage.appendByte((byte) 10); // This means we must send an ack message back.
         }
 
-        Buffer encryptedPayload = new Buffer();
+        // Yes this is starting to look like some amazing callback hell... We are doing this to utilize jsync.io's event loop
+        // to attempt to not utilize so much processing power.
+        localAsync.executeBlocking(() -> {
+            Buffer encryptedPayload = new Buffer();
+            Buffer payloadData = CryptoUtil.encryptRSA(peerKey, payloadMessage);
+            encryptedPayload.appendInt(payloadData.length());
+            encryptedPayload.appendBuffer(payloadData);
+            return encryptedPayload;
+        }, event -> {
+            Buffer encryptedPayload = event.result();
+            localAsync.executeBlocking(() -> {
+                Buffer hashData = new Buffer();
+                hashData.appendBytes(peerPublicKeyData);
+                hashData.appendBuffer(payloadMessage);
+                hashData.appendBuffer(message);
+                return CryptoUtils.calculateSHA512(hashData.getBytes());
+            }, event15 -> {
+                String msgHash = event15.result();
 
-        Buffer payloadData = CryptoUtil.encryptRSA(peerKey, payloadMessage);
+                Buffer broadcastMessage = new Buffer();
+                broadcastMessage.appendInt(msgHash.length());
+                broadcastMessage.appendString(msgHash);
+                broadcastMessage.appendBuffer(encryptedPayload);
 
-        encryptedPayload.appendInt(payloadData.length());
-        encryptedPayload.appendBuffer(payloadData);
+                localAsync.executeBlocking(() -> {
+                    // This represents the actual message we want to send
+                    Buffer messageToEncrypt = new Buffer();
+                    messageToEncrypt.appendInt(message.length());
+                    messageToEncrypt.appendBuffer(message);
+                    // Let's construct the acknowledgement message
+                    if (requiresAck) {
 
-        Buffer hashData = new Buffer();
-        hashData.appendBytes(peerPublicKeyData);
-        hashData.appendBuffer(payloadMessage);
-        hashData.appendBuffer(message);
+                        // Let's construct the ack payload that the final peer will broadcast.
 
-        String msgHash = CryptoUtils.calculateSHA512(hashData.getBytes());
+                        // This is the message that we will receive back when the reply is received.
+                        Buffer ackReplyMessage = new Buffer();
+                        ackReplyMessage.appendInt(msgHash.length());
+                        ackReplyMessage.appendString(msgHash);
 
-        // This helps us ensure the message wasn't tampered with.
-        Buffer newBuffer = new Buffer();
-        newBuffer.appendInt(msgHash.length());
-        newBuffer.appendString(msgHash);
-        newBuffer.appendBuffer(encryptedPayload);
+                        // Let's create a handler that will go ahead and construct the message we are going
+                        // to broadcast.
+                        Handler<AsyncResult<Map.Entry<String, Buffer>>> ackMessageResultHandler = event152 -> localAsync.executeBlocking(() -> {
 
-        Buffer messageToEncrypt = new Buffer();
+                            // Let's go ahead and construct our final message.
 
-        messageToEncrypt.appendInt(message.length());
-        messageToEncrypt.appendBuffer(message);
+                            String peerAddress = event152.result().getKey();
 
-        // Let's construct the acknowledgement message
-        if (requiresAck) {
+                            Buffer encryptedAckMessage = event152.result().getValue();
 
-            Buffer ackReplyMessage = new Buffer();
-            ackReplyMessage.appendInt(msgHash.length());
-            ackReplyMessage.appendString(msgHash);
+                            // Let's construct the final ack message
+                            Buffer finalAckMessage = new Buffer();
 
-            BiConsumer<String, Buffer> messageConsumer = (peerAddress, finalAckMessage) -> {
+                            finalAckMessage.appendInt(peerAddress.length());
+                            finalAckMessage.appendString(peerAddress);
 
-                Buffer ackReplyData = new Buffer();
+                            finalAckMessage.appendInt(encryptedAckMessage.length());
+                            finalAckMessage.appendBuffer(encryptedAckMessage);
 
-                ackReplyData.appendInt(peerAddress.length());
-                ackReplyData.appendString(peerAddress);
+                            // Let's ensure we add this so the peer knows the broadcast an ack message.
+                            messageToEncrypt.appendInt(EVAPMessage.PayloadType.ACK.code);
+                            messageToEncrypt.appendInt(finalAckMessage.length());
+                            messageToEncrypt.appendBuffer(finalAckMessage);
 
-                ackReplyData.appendInt(finalAckMessage.length());
-                ackReplyData.appendBuffer(finalAckMessage);
+                            // TODO - develop different and more efficient way of handling ack messages.
 
-                messageToEncrypt.appendInt(EVAPMessage.PayloadType.ACK.code);
-                messageToEncrypt.appendInt(ackReplyData.length());
-                messageToEncrypt.appendBuffer(ackReplyData);
+                            // Let's go ahead and check to see if an ack response was received.
+                            // This honestly isn't the BEST thing in the world..
+                            if (ackTimeout > 0 && ackTimeoutTimeUnit != null) {
+                                long timeoutTimer = localAsync.setPeriodic(ackTimeoutTimeUnit.toMillis(ackTimeout), new Handler<Long>() {
+                                    int retryCount = 0;
 
-                // Let's handle the ack timeout!
-                if(ackTimeout > 0 && ackTimeoutTimeUnit != null){
-                    long timeoutTimer = localAsync.setPeriodic(ackTimeoutTimeUnit.toMillis(ackTimeout), new Handler<Long>() {
-                        int retryCount = 0;
-                        @Override
-                        public void handle(Long event) {
-                            retryCount++;
-                            if(retryCount > rebroadcastCount){
-                                localAsync.cancelTimer(event);
-                                ackResponseHandlers.remove(msgHash);
-                                localAsync.runOnContext(event1 -> ackHandler.handle(new DefaultFutureResult<>(new Exception("Acknowledgement not received before timeout! Maximum amount of message rebroadcasts reached."))));
-                                return;
+                                    @Override
+                                    public void handle(Long event13) {
+                                        retryCount++;
+                                        if (retryCount > rebroadcastCount) {
+                                            localAsync.cancelTimer(event13);
+                                            ackResponseHandlers.remove(msgHash);
+                                            localAsync.runOnContext(event1 -> ackHandler.handle(new DefaultFutureResult<>(new Exception("Acknowledgement not received before timeout! Maximum amount of message rebroadcasts reached."))));
+                                            return;
+                                        }
+                                        localAsync.runOnContext(event1 -> ackHandler.handle(new DefaultFutureResult<>(new Exception("Acknowledgement not received before timeout! Rebroadcasting message..."))));
+                                    }
+                                });
+                                ackResponseHandlers.put(msgHash, putEvent -> {
+                                    localAsync.cancelTimer(timeoutTimer);
+                                    localAsync.runOnContext(ignored -> ackHandler.handle(putEvent));
+                                });
+                            } else {
+                                // There is no timeout.. so let's simply store the handler away.
+                                ackResponseHandlers.put(msgHash, ackHandler);
                             }
-                            localAsync.runOnContext(event1 -> ackHandler.handle(new DefaultFutureResult<>(new Exception("Acknowledgement not received before timeout! Rebroadcasting message..."))));
+
+                            // Encrypt the actual message data.
+                            Buffer encryptedMessage = CryptoUtil.encrypt(secretKey, messageToEncrypt);
+
+                            broadcastMessage.appendInt(encryptedMessage.length());
+                            broadcastMessage.appendBuffer(encryptedMessage);
+
+                            // If the payloadPeer is our own, we will go ahead and sign it.
+                            if(payloadPeer.equals(EVAPPeerService.this.peerKeyHash)){
+                                Buffer signedData = CryptoUtil.signRSA(encryptedMessage, privateKey);
+
+                                broadcastMessage.appendInt(signedData.length());
+                                broadcastMessage.appendBuffer(signedData);
+                            }
+
+                            Buffer finalBroadcastMessage = new Buffer();
+
+                            finalBroadcastMessage.appendInt(broadcastMessage.length());
+                            finalBroadcastMessage.appendBuffer(broadcastMessage);
+
+                            return finalBroadcastMessage;
+                        }, event14 -> localAsync.runOnContext(event12 -> resultHandler.handle(new DefaultFutureResult<>(new AbstractMap.SimpleEntry<>(calculateSHA1(peerPublicKeyData), event14.result())))));
+
+                        // Let's go ahead and construct a message that will be sent back to us.
+
+                        // Let's construct an ack message depending on our setup
+                        if (multiLayerSupportEnabled && false) { // Disabled for now
+                            // This will go ahead and ensure that the ack message that is sent, is always a multi-layered message.
+                            constructMultiLayerMessage(payloadPeer, publicKey.getEncoded(),
+                                    EVAPMessage.PayloadType.ACK.code, ackReplyMessage, ackMessageResultHandler);
+                        } else {
+                            // This is the message that we should receive back.
+                            constructPeerMessage(payloadPeer, publicKey.getEncoded(),
+                                    EVAPMessage.PayloadType.ACK.code, ackReplyMessage, ackMessageResultHandler);
                         }
-                    });
-                    ackResponseHandlers.put(msgHash, event -> {
-                        localAsync.cancelTimer(timeoutTimer);
-                        localAsync.runOnContext(ignored -> ackHandler.handle(event));
-                    });
-                } else {
-                    ackResponseHandlers.put(msgHash, ackHandler);
-                }
-            };
 
-            if(multiLayerSupportEnabled){
-                // This will go ahead and ensure that the ack message that is sent, is always a multi-layered message.
-                constructMultiLayerMessage(publicKey.getEncoded(),
-                        EVAPMessage.PayloadType.ACK.code, ackReplyMessage, messageConsumer);
-            } else {
-                // This is the message that we should receive back.
-                constructPeerMessage(payloadPeer, publicKey.getEncoded(),
-                        EVAPMessage.PayloadType.ACK.code, ackReplyMessage, messageConsumer);
-            }
-        }
+                        // Let's return null since we do not want the handler
+                        // to handle the response.
+                        return null;
+                    }
 
-        // Encrypt the actual message data.
-        Buffer encryptedMessage = CryptoUtil.encrypt(secretKey, messageToEncrypt);
+                    return messageToEncrypt;
+                }, event151 -> {
+                    if(event151.result() != null){
+                        localAsync.executeBlocking(() -> {
 
-        newBuffer.appendInt(encryptedMessage.length());
-        newBuffer.appendBuffer(encryptedMessage);
+                            Buffer encryptedData = CryptoUtil.encrypt(secretKey, event151.result());
 
-        Buffer finalMessage = new Buffer();
+                            broadcastMessage.appendInt(encryptedData.length());
+                            broadcastMessage.appendBuffer(encryptedData);
 
-        finalMessage.appendInt(newBuffer.length());
-        finalMessage.appendBuffer(newBuffer);
+                            // Let's ensure that this messages is verified.
+                            if(payloadPeer.equals(EVAPPeerService.this.peerKeyHash)){
+                                Buffer signedData = CryptoUtil.signRSA(encryptedData, privateKey);
 
-        // We must ensure that the data is signed.
-        /*Buffer signedData = new Buffer();
+                                broadcastMessage.appendInt(signedData.length());
+                                broadcastMessage.appendBuffer(signedData);
+                            }
 
-        signedData.appendBuffer(signRSA(newBuffer, localService.privateKey));
+                            Buffer finalBroadcastMessage = new Buffer();
 
-        finalMessage.appendInt(signedData.length());
-        finalMessage.appendBuffer(signedData);*/
-
-        consumer.accept(calculateSHA1(peerPublicKeyData), finalMessage);
-
+                            finalBroadcastMessage.appendInt(broadcastMessage.length());
+                            finalBroadcastMessage.appendBuffer(broadcastMessage);
+                            return finalBroadcastMessage;
+                        }, event1 -> localAsync.runOnContext(event12 -> resultHandler.handle(new DefaultFutureResult<>(new AbstractMap.SimpleEntry<>(calculateSHA1(peerPublicKeyData), event1.result())))));
+                    }
+                });
+            });
+        });
     }
 
     /**
@@ -854,67 +1088,93 @@ public class EVAPPeerService implements ClusterService {
      * @param finalPeerPublicKeyData
      * @param msgType
      * @param message
-     * @param consumer
+     * @param resultHandler
      */
-    private void constructMultiLayerMessage(byte[] finalPeerPublicKeyData, int msgType, Buffer message, BiConsumer<String, Buffer> consumer){
+    private void constructMultiLayerMessage(String payloadPeer, byte[] finalPeerPublicKeyData, int msgType, Buffer message, Handler<AsyncResult<Map.Entry<String, Buffer>>> resultHandler) {
+
+        // TODO Note this is very broken.
 
         // TODO develop messages that are routed through many routes. This ensures a message lives.
-
-        if(trustedPeers.size() == 0 || localPeerTable.size() == 0){
-            logger.error("It looks like there aren't any relay peers available!");
-            return;
+        if (trustedPeers.size() == 0 || localPeerTable.size() == 0) {
+            throw new RuntimeException("It looks like there aren't any relay peers available!");
         }
-
         // Note: this will construct a layered message meant to pass through multiple peers. These peers are
         // trusted relay peers and generally they must trust you to relay the messages.
 
-        // We need to ensure we create the initial message.
-        Buffer lastMessage = new Buffer();
+        List<String> relayPeers = new LinkedList<>(localPeerTable.keySet());
 
-        byte[] lastPeer = null;
+        Collections.shuffle(relayPeers, CryptoUtil.getSecureRandom());
 
-        List<String> nTrustedRelayPeers = new LinkedList<>(trustedPeers);
+        relayPeers.forEach(new Consumer<String>() {
 
-        Collections.shuffle(nTrustedRelayPeers, CryptoUtil.getSecureRandom());
+            boolean handlingAsync = false;
 
-        String[] trustedPeers = nTrustedRelayPeers.toArray(new String[this.trustedPeers.size()]);
+            List<Handler<Void>> nextHandlers = new CopyOnWriteArrayList<>();
 
-        for (int i = 0; i < trustedPeers.length; i++) {
-            String trustedRelayPeer = trustedPeers[i];
-            byte[] peerKeyData = getPublicKey(trustedRelayPeer);
+            // We need to ensure we create the initial message.
+            Buffer lastMessage = null;
 
-            String[] peerAddress = new String[1];
+            byte[] lastPeer = null;
 
-            Buffer finalLastMessage = new Buffer();
+            @Override
+            public void accept(final String relayPeer) {
+                Handler<Void> process = event -> {
 
-            if(lastMessage.length() == 0){
-                constructPeerMessage(trustedRelayPeer, finalPeerPublicKeyData, msgType, message, (peerAddr, buffer) -> {
-                    peerAddress[0] = peerAddr;
+                    final byte[] peerKeyData = getPublicKey(relayPeer);
 
-                    finalLastMessage.appendBuffer(buffer);
-                });
-            } else {
-                peerAddress[0] = calculateSHA1(lastPeer);
-                finalLastMessage.appendBuffer(lastMessage);
+                    handlingAsync = true;
+
+                    String peerAddress = calculateSHA1(lastPeer);
+
+                    Buffer relayMessage = new Buffer();
+
+                    relayMessage.appendInt(peerAddress.length());
+                    relayMessage.appendString(peerAddress);
+
+                    relayMessage.appendInt(lastMessage.length());
+                    relayMessage.appendBuffer(lastMessage);
+
+                    constructPeerMessage(relayPeers.get(relayPeers.size() - 1).equals(relayPeer) ? payloadPeer : relayPeer, peerKeyData, EVAPMessage.PayloadType.MESSAGE_RELAY.code, relayMessage, new Handler<AsyncResult<Map.Entry<String, Buffer>>>() {
+                        @Override
+                        public void handle(AsyncResult<Map.Entry<String, Buffer>> event) {
+                            Map.Entry<String, Buffer> result = event.result();
+                            lastMessage = result.getValue();
+                            lastPeer = peerKeyData;
+
+                            handlingAsync = false;
+
+                            if(nextHandlers.size() > 0){
+                                localAsync.runOnContext(nextHandlers.remove(nextHandlers.size() - 1));
+                            } else {
+                                String lastPeerAddress = calculateSHA1(lastPeer);
+                                localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>(new AbstractMap.SimpleEntry<>(lastPeerAddress, lastMessage))));
+                            }
+                        }
+                    });
+                };
+
+                System.out.println("processing. " + relayPeer);
+
+                if(handlingAsync){
+                    nextHandlers.add(process);
+                    return;
+                }
+
+                // We need to construct the initial message
+                if (lastMessage.length() == 0 || lastMessage == null) {
+                    constructPeerMessage(relayPeer, finalPeerPublicKeyData, msgType, message, event -> {
+                        handlingAsync = true;
+                        handlingAsync = true;
+                        lastPeer = getPublicKey(event.result().getKey());
+                        lastMessage = event.result().getValue();
+
+                        localAsync.runOnContext(process);
+                    });
+                } else {
+                    localAsync.runOnContext(process);
+                }
             }
-
-            Buffer relayMessage = new Buffer();
-
-            relayMessage.appendInt(peerAddress[0].length());
-            relayMessage.appendString(peerAddress[0]);
-
-            relayMessage.appendInt(finalLastMessage.length());
-            relayMessage.appendBuffer(finalLastMessage);
-
-            lastMessage = new Buffer();
-
-            Buffer actualLastMessage = lastMessage;
-            constructPeerMessage((i == trustedRelayPeer.length() - 1) ? peerKeyHash : trustedRelayPeer, peerKeyData, EVAPMessage.PayloadType.MESSAGE_RELAY.code, relayMessage, (ignored, buffer) -> actualLastMessage.appendBuffer(buffer));
-
-            lastPeer = peerKeyData;
-        }
-
-        consumer.accept(calculateSHA1(lastPeer), lastMessage);
+        });
     }
 
     @Override

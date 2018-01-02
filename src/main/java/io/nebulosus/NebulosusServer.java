@@ -8,6 +8,7 @@ import com.hazelcast.core.IMap;
 import com.hazelcast.core.MapLoader;
 import com.hazelcast.core.MapStoreFactory;
 import com.hazelcast.map.merge.LatestUpdateMapMergePolicy;
+import io.jsync.Handler;
 import io.jsync.app.ClusterApp;
 import io.jsync.app.core.Cluster;
 import io.jsync.app.core.Config;
@@ -16,6 +17,7 @@ import io.jsync.app.core.persistence.impl.DummyDataPersistor;
 import io.jsync.app.core.service.ClusterService;
 import io.jsync.json.JsonObject;
 import io.jsync.logging.impl.LoggerFactory;
+import io.jsync.utils.Token;
 import io.nebulosus.evap.EVAPPeerService;
 import io.nebulosus.ipfs.IPFSCryptoPersistor;
 import io.nebulosus.sockjs.SockJSAPIService;
@@ -33,7 +35,7 @@ public class NebulosusServer extends ClusterApp {
         System.setProperty("hazelcast.phone.home.enabled", "false");
         System.setProperty("hazelcast.socket.bind.any", "false");
         System.setProperty("async.pool.eventloop.size", String.valueOf(Runtime.getRuntime().availableProcessors() * 2));
-        System.setProperty("async.pool.worker.size", String.valueOf(Runtime.getRuntime().availableProcessors() * 10));
+        System.setProperty("async.pool.worker.size", String.valueOf(Runtime.getRuntime().availableProcessors() * 4));
 
         System.setProperty("org.apache.sshd.security.provider.BC.enabled", "false");
 

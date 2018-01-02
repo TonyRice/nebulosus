@@ -25,6 +25,7 @@ import io.jsync.json.impl.Base64;
 import io.jsync.logging.Logger;
 import io.jsync.logging.impl.LoggerFactory;
 import io.jsync.utils.CryptoUtils;
+import io.nebulosus.evap.EVAPMessage;
 import io.nebulosus.evap.EVAPPeerService;
 import io.nebulosus.util.CryptoUtil;
 import org.mapdb.DB;
@@ -84,6 +85,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
     private boolean initialized = false;
 
+    private List<String> replicationPeers = new LinkedList<>();
     private List<String> evapPeers = new LinkedList<>();
     private boolean evapEnabled = false;
 
@@ -110,9 +112,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
         Config config = current.cluster().config();
 
         if (config == null) {
-
-            System.out.println("Config is empty!");
-
             config = new Config();
             config.open(config.getConfigPath());
         }
@@ -123,7 +122,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
         // This may be completely irrelevant
         //String store = ipfsConfig.getString("store", "ipfs_crypto");
         String storePass = ipfsConfig.getString("crypto_pass", "ChangeMeNow!");
-        String saltData = ipfsConfig.getString("crypto_shash", "");
+        final String[] saltData = {ipfsConfig.getString("crypto_shash", "")};
 
         //ipfsConfig.putString("store", store);
         ipfsConfig.putString("crypto_pass", storePass);
@@ -150,7 +149,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
         IPFS ipfs = ipfsClientPool.get();
 
         try {
-            if(saltData == null || saltData.isEmpty()){
+            if(saltData[0] == null || saltData[0].isEmpty()){
                 secretKey = CryptoUtil.generateSecretKey(cryptoPass, salt -> {
                     try {
                         NamedStreamable.ByteArrayWrapper saltFile = new NamedStreamable.ByteArrayWrapper(CryptoUtils.calculateSHA1(salt), salt);
@@ -159,22 +158,47 @@ public class IPFSCryptoPersistor implements DataPersistor {
                         // Ensure we pin this.
                         ipfs.pin.add(addResult.get(0).hash);
 
+                        saltData[0] = addResult.get(0).hash.toString();
+
                         ipfsConfig.putString("crypto_shash", addResult.get(0).hash.toString());
+
                     } catch (Exception e){
                         e.printStackTrace();
                     }
                 });
             } else {
                 // Let's go ahead and retrieve the salt from IPFS
-                Multihash saltPointer = Multihash.fromBase58(saltData);
+                Multihash saltPointer = Multihash.fromBase58(saltData[0]);
                 byte[] salt = ipfs.cat(saltPointer);
                 secretKey = CryptoUtil.generateSecretKey(cryptoPass, salt);
             }
 
-            mapHash = CryptoUtils.calculateHmacSHA1(mapName.getBytes(), CryptoUtils.calculateSHA512((cryptoPass + mapName).getBytes()));
+            mapHash = CryptoUtils.calculateHmacSHA1((mapName + saltData[0]).getBytes(), CryptoUtils.calculateSHA512((cryptoPass + mapName).getBytes()));
             shortMapHash = mapHash.substring(0, 12);
 
             Config finalConfig = config;
+
+            EVAPPeerService.ready(evapPeerService -> {
+                // TODO we do not want to handle key updates within our local cluster.
+                // This is where we will handle messages from trusted EVAP peers.
+                evapPeerService.handleMessage(event -> {
+                    if(event.succeeded()){
+                        EVAPMessage message = event.result();
+                        Buffer messageData = message.getData();
+                        // Always remember to keep it 100.
+                        if(messageData.getInt(0) == 100){
+                            int mapHashLen = messageData.getInt(4);
+                            String mapHash = messageData.getString(8, mapHashLen + 8);
+                            if(IPFSCryptoPersistor.this.mapHash.equals(mapHash)){
+                                int dataLen = messageData.getInt(mapHashLen + 8);
+                                Buffer data = messageData.getBuffer(mapHashLen + 12, mapHashLen + dataLen + 12);
+
+                                eventBus.publish("nb.event." + mapHash, data);
+                            }
+                        }
+                    }
+                });
+            });
 
             Handler<Void> finishStartup = ignored -> {
 
@@ -185,98 +209,104 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                 eventBus.registerHandler("nb.event." + mapHash, (Handler<Message<Buffer>>) event -> {
 
-                    localAsync.executeBlocking(() -> {
+                    decryptMessageData(event.body(), new Handler<AsyncResult<Buffer>>() {
+                        @Override
+                        public void handle(AsyncResult<Buffer> event) {
 
-                        // Let's get the actual message.
-                        return decryptMessageData(event.body());
+                            if(event.failed()){
+                                if(event.cause() != null){
+                                    event.cause().printStackTrace();
+                                }
+                                return;
+                            }
 
-                    }, event1 -> {
-                        Buffer evtBuffer = event1.result();
+                            Buffer evtBuffer = event.result();
 
-                        int pos = 0;
+                            int pos = 0;
 
-                        int evtType = evtBuffer.getInt(pos);
-                        pos += 4;
-
-                        int nodeLen = evtBuffer.getInt(pos);
-                        pos += 4;
-
-                        String nodeId = evtBuffer.getString(pos, nodeLen + pos);
-                        pos += nodeLen;
-
-                        // Unless it is event type 75 which will simply
-                        // save the latest key index to our configuration.
-                        if (nodeId.equals(cluster.manager().nodeId()) && evtType != 75 && evtType != 70) {
-                            return; // We do not need to do anything at all.
-                        }
-
-                        // This means we are receiving the latest
-                        // data for a key.
-                        if (evtType == 65) {
-
-                            int keyLen = evtBuffer.getInt(pos);
+                            int evtType = evtBuffer.getInt(pos);
                             pos += 4;
 
-                            String key = evtBuffer.getString(pos, pos + keyLen);
+                            int nodeLen = evtBuffer.getInt(pos);
+                            pos += 4;
 
-                            pos += keyLen;
+                            String nodeId = evtBuffer.getString(pos, nodeLen + pos);
+                            pos += nodeLen;
 
-                            long blobLen = evtBuffer.getLong(pos);
-                            pos += 8;
-
-                            byte[] cryptoBlobData = evtBuffer.getBytes(pos, Math.toIntExact(pos + blobLen));
-
-                            // Let's ensure we also store the data locally
-                            storeLocally(key, cryptoBlobData);
-
-                        } else if (evtType == 70) {
-
-                            // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
-                            // We initializing the database it will load all thy keys..
-                            String vtIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\\n", "");
-
-                            String previous = ipfsConfig.getString(shortMapHash + "vt_index", "");
-
-                            if (!previous.isEmpty()) {
-                                logger.info("Replacing previous vt index \"" + previous + "\" with \"" + vtIndex + "\".");
+                            // Unless it is event type 75 which will simply
+                            // save the latest key index to our configuration.
+                            if (nodeId.equals(cluster.manager().nodeId()) && evtType != 75 && evtType != 70) {
+                                return; // We do not need to do anything at all.
                             }
 
-                            ipfsConfig.putString(shortMapHash + "vt_index", vtIndex);
+                            // This means we are receiving the latest
+                            // data for a key.
+                            if (evtType == 65) {
 
-                            // Let's make sure we save the config
-                            clusterConfig.putObject("ipfs", ipfsConfig);
+                                int keyLen = evtBuffer.getInt(pos);
+                                pos += 4;
 
-                            finalConfig.rawConfig().putObject("cluster", clusterConfig);
-                            finalConfig.save();
+                                String key = evtBuffer.getString(pos, pos + keyLen);
 
-                            logger.info("Saved latest value table index for the map \"" + mapName + "\".");
+                                pos += keyLen;
 
-                            valueTableIndex = vtIndex;
+                                long blobLen = evtBuffer.getLong(pos);
+                                pos += 8;
 
-                        } else if (evtType == 75) {
+                                byte[] cryptoBlobData = evtBuffer.getBytes(pos, Math.toIntExact(pos + blobLen));
 
-                            // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
-                            // We initializing the database it will load all thy keys..
-                            String ktIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\n", "");
+                                // Let's ensure we also store the data locally
+                                storeLocally(key, cryptoBlobData);
 
-                            String previous = ipfsConfig.getString(shortMapHash + "kt_index", "");
+                            } else if (evtType == 70) {
 
-                            if (!previous.isEmpty()) {
-                                logger.info("Replacing previous key-table index \"" + previous + "\" with \"" + ktIndex + "\".");
+                                // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
+                                // We initializing the database it will load all thy keys..
+                                String vtIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\\n", "");
+
+                                String previous = ipfsConfig.getString(shortMapHash + "vt_index", "");
+
+                                if (!previous.isEmpty()) {
+                                    logger.info("Replacing previous vt index \"" + previous + "\" with \"" + vtIndex + "\".");
+                                }
+
+                                ipfsConfig.putString(shortMapHash + "vt_index", vtIndex);
+
+                                // Let's make sure we save the config
+                                clusterConfig.putObject("ipfs", ipfsConfig);
+
+                                finalConfig.rawConfig().putObject("cluster", clusterConfig);
+                                finalConfig.save();
+
+                                //logger.info("Saved latest value table index for the map \"" + mapName + "\".");
+
+                                valueTableIndex = vtIndex;
+
+                            } else if (evtType == 75) {
+
+                                // Let's store this data. It is essentially the KeyTable index which is stored on IPFS.
+                                // We initializing the database it will load all thy keys..
+                                String ktIndex = Base64.encodeBytes(evtBuffer.getBytes(nodeLen + 8, evtBuffer.length())).replaceAll("\n", "");
+
+                                String previous = ipfsConfig.getString(shortMapHash + "kt_index", "");
+
+                                if (!previous.isEmpty()) {
+                                    logger.info("Replacing previous key-table index \"" + previous + "\" with \"" + ktIndex + "\".");
+                                }
+
+                                ipfsConfig.putString(shortMapHash + "kt_index", ktIndex);
+
+                                // Let's make sure we save the config
+                                clusterConfig.putObject("ipfs", ipfsConfig);
+
+                                finalConfig.rawConfig().putObject("cluster", clusterConfig);
+                                finalConfig.save();
+
+                                logger.info("Saved latest key table index for the map \"" + mapName + "\".");
+
+                                keyTableIndex = ktIndex;
+
                             }
-
-                            ipfsConfig.putString(shortMapHash + "kt_index", ktIndex);
-
-                            // Let's make sure we save the config
-                            clusterConfig.putObject("ipfs", ipfsConfig);
-
-                            finalConfig.rawConfig().putObject("cluster", clusterConfig);
-                            finalConfig.save();
-
-                            logger.info("Saved latest key table index for the map \"" + mapName + "\".");
-
-                            keyTableIndex = ktIndex;
-
                         }
                     });
                 });
@@ -612,7 +642,6 @@ public class IPFSCryptoPersistor implements DataPersistor {
                     });
                     return;
                 }
-
                 _saveKeyTableCache(resultHandler);
             });
             return;
@@ -676,7 +705,7 @@ public class IPFSCryptoPersistor implements DataPersistor {
                             .cleanerHackEnable()
                             .make();
 
-                    HTreeMap tmpKeyTableCache = tmpFileDB.hashMap("ktcache").createOrOpen();;
+                    HTreeMap tmpKeyTableCache = tmpFileDB.hashMap("ktcache").createOrOpen();
 
                     tmpKeyTableCache.put("____vt_index", valueTableIndex);
 
@@ -700,37 +729,31 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                     logger.info("Attempting to encrypt the master file for temporary IPFS storage.");
 
-                    fs.readFile(tmpFile, tmpFileRead -> localAsync.executeBlocking(() -> {
+                    fs.readFile(tmpFile, new Handler<AsyncResult<Buffer>>() {
+                        @Override
+                        public void handle(AsyncResult<Buffer> event) {
+                            createCryptoBlob(event.result(), new Handler<AsyncResult<Buffer>>() {
+                                @Override
+                                public void handle(AsyncResult<Buffer> event) {
+                                    Buffer cryptoData = event.result();
 
-                        logger.info("Encrypting \"" + tmpFile + "\" for IPFS storage.");
+                                    IPFSCryptoPersistor.this.keyTableIndex = Base64.encodeBytes(cryptoData.getBytes()).replaceAll("\n", "");
 
-                        // We are encrypting this data while storing
-                        // the IV between each server. This will make it easy
-                        // to decrypt.
-                        return createCryptoBlob(tmpFileRead.result(), true);
-                    }, cryptEvent -> {
+                                    publishEvent(75, cryptoData, true);
 
-                        if (cryptEvent.failed()) {
-                            resultHandler.handle(new DefaultFutureResult<>(new IOException("Could not encrypt \"" + tmpFile + "\"!")));
-                            return;
+                                    // Don't ask why i'm doing this.
+                                    localAsync.executeBlocking(() -> {
+                                        fs.deleteSync(tmpFile);
+                                        logger.info("Deleted temporary cache file at \"" + tmpFile + "\".");
+                                        return null;
+                                    }, (Handler<AsyncResult<Void>>) event12 -> {
+                                        lock.forceUnlock();
+                                        localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>()));
+                                    });
+                                }
+                            }, true);
                         }
-
-                        Buffer cryptoData = cryptEvent.result();
-
-                        this.keyTableIndex = Base64.encodeBytes(cryptoData.getBytes()).replaceAll("\n", "");
-
-                        publishEvent(75, cryptoData);
-
-                        // Don't ask why i'm doing this.
-                        localAsync.executeBlocking(() -> {
-                            fs.deleteSync(tmpFile);
-                            logger.info("Deleted temporary cache file at \"" + tmpFile + "\".");
-                            return null;
-                        }, (Handler<AsyncResult<Void>>) event12 -> {
-                            lock.forceUnlock();
-                            localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>()));
-                        });
-                    }));
+                    });
                 });
 
                 localAsync.executeBlocking(() -> {
@@ -825,38 +848,32 @@ public class IPFSCryptoPersistor implements DataPersistor {
 
                     logger.info("Attempting to encrypt \"" + tmpFile + "\" for IPFS storage.");
 
-                    fs.readFile(tmpFile, tmpFileRead -> localAsync.executeBlocking(() -> {
+                    fs.readFile(tmpFile, new Handler<AsyncResult<Buffer>>() {
+                        @Override
+                        public void handle(AsyncResult<Buffer> tmpFileRead) {
+                            createCryptoBlob(tmpFileRead.result(), new Handler<AsyncResult<Buffer>>() {
+                                @Override
+                                public void handle(AsyncResult<Buffer> event) {
 
-                        logger.info("Encrypting \"" + tmpFile + "\" for IPFS storage.");
+                                    Buffer cryptoData = event.result();
 
-                        // We are encrypting this data while storing
-                        // the IV between each server. This will make it easy
-                        // to decrypt.
-                        return createCryptoBlob(tmpFileRead.result(), true);
-                    }, cryptEvent -> {
+                                    IPFSCryptoPersistor.this.valueTableIndex = Base64.encodeBytes(cryptoData.getBytes()).replaceAll("\n", "");
 
-                        if (cryptEvent.failed()) {
-                            resultHandler.handle(new DefaultFutureResult<>(new IOException("Could not encrypt \"" + tmpFile + "\"!")));
-                            return;
+                                    publishEvent(70, cryptoData, true);
+
+                                    localAsync.executeBlocking(() -> {
+                                        fs.deleteSync(tmpFile);
+                                        logger.info("Deleting \"" + tmpFile + "\".");
+                                        return null;
+                                    }, (Handler<AsyncResult<Void>>) event12 -> {
+                                        lock.forceUnlock();
+                                        localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>()));
+                                    });
+
+                                }
+                            }, true);
                         }
-
-                        logger.info("Finished encrypting \"" + tmpFile + "\" for IPFS storage.");
-
-                        Buffer cryptoData = cryptEvent.result();
-
-                        this.valueTableIndex = Base64.encodeBytes(cryptoData.getBytes()).replaceAll("\n", "");
-
-                        publishEvent(70, cryptoData);
-
-                        localAsync.executeBlocking(() -> {
-                            fs.deleteSync(tmpFile);
-                            logger.info("Deleting \"" + tmpFile + "\".");
-                            return null;
-                        }, (Handler<AsyncResult<Void>>) event12 -> {
-                            lock.forceUnlock();
-                            localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>()));
-                        });
-                    }));
+                    });
                 });
 
                 localAsync.executeBlocking(() -> {
@@ -938,161 +955,196 @@ public class IPFSCryptoPersistor implements DataPersistor {
         }
     }
 
-    private Buffer createCryptoBlob(Buffer data) {
-        return createCryptoBlob(data, false);
+    private void createCryptoBlob(Buffer data, Handler<AsyncResult<Buffer>> resultHandler) {
+        createCryptoBlob(data, resultHandler, false);
     }
 
     /**
      * This is used to encrypt a piece of data and return a buffer with the data and iv stored with in it. This is generally
      * stored in memory and later stored via ipfs.
-     *
-     * @param data the data you wish to encrypt.
-     * @return the "crypto blob"
      */
-    private Buffer createCryptoBlob(Buffer data, boolean storeOnIpfs) {
+    private void createCryptoBlob(Buffer data, Handler<AsyncResult<Buffer>> resultHandler, boolean storeOnIpfs) {
+        localAsync.executeBlocking(() -> {
+            try {
+                Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+                AlgorithmParameters params = cipher.getParameters();
+                byte[] iv = params.getParameterSpec(IvParameterSpec.class).getIV();
+                byte[] dataToEnc = data.getBytes();
+                return new AbstractMap.SimpleEntry<>(iv, cipher.doFinal(dataToEnc));
+            } catch (Exception e){
+                throw new RuntimeException(e);
+            }
+        }, new Handler<AsyncResult<Map.Entry<byte[], byte[]>>>() {
+            @Override
+            public void handle(AsyncResult<Map.Entry<byte[], byte[]>> event) {
 
-        try {
+                Map.Entry<byte[], byte[]> entry = event.result();
 
-            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey);
-            AlgorithmParameters params = cipher.getParameters();
+                byte[] iv = entry.getKey();
+                byte[] encrypted = entry.getValue();
 
-            byte[] iv = params.getParameterSpec(IvParameterSpec.class).getIV();
+                Buffer newData = new Buffer();
 
-            byte[] dataToEnc = data.getBytes();
+                if (storeOnIpfs) {
 
-            byte[] encrypted = cipher.doFinal(dataToEnc);
+                    // 12 is an identifier that let's us know that this
+                    // is an encrypted ipfs blob.
+                    newData.appendInt(12);
 
-            Buffer newData = new Buffer();
+                    storeIPFSData(CryptoUtils.calculateSHA1(iv), encrypted, true, event12 -> {
+                        String hash = event12.result();
+                        newData.appendInt(hash.length());
+                        newData.appendString(hash);
 
-            if (storeOnIpfs) {
+                        newData.appendInt(iv.length);
+                        newData.appendBytes(iv);
 
-                // 12 is an identifier that let's us know that this
-                // is an encrypted ipfs blob.
-                newData.appendInt(12);
+                        localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>(newData)));
 
-                String hash = storeIPFSData(CryptoUtils.calculateSHA1(iv), encrypted, true);
+                    });
+                    return;
+                }
 
-                newData.appendInt(hash.length());
-                newData.appendString(hash);
-
-            } else {
 
                 // 13 signifies raw encrypted data.
                 newData.appendInt(13);
                 newData.appendInt(encrypted.length);
                 newData.appendBytes(encrypted);
+
+                newData.appendInt(iv.length);
+                newData.appendBytes(iv);
+
+                localAsync.runOnContext(event1 -> resultHandler.handle(new DefaultFutureResult<>(newData)));
+
+            }
+        });
+    }
+
+    private void decryptMessageData(Buffer data, Handler<AsyncResult<Buffer>> resultHandler) {
+        localAsync.executeBlocking(() -> {
+
+            try {
+                int pos = 0;
+                int ivLen = data.getInt(pos);
+                pos += 4;
+
+                byte[] iv = data.getBytes(pos, ivLen + pos);
+                pos += ivLen;
+
+                int dataLen = data.getInt(pos);
+                pos += 4;
+
+                byte[] encrypted = data.getBytes(pos, dataLen + pos);
+
+                Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
+                IvParameterSpec ivParameterSpec = new IvParameterSpec(iv);
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec);
+
+                return new Buffer(cipher.doFinal(encrypted));
+
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }, event -> resultHandler.handle(event));
+
+    }
+
+    private void encryptMessageData(Buffer data, Handler<AsyncResult<Buffer>> resultHandler) {
+        localAsync.executeBlocking(() -> {
+            try {
+                Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey);
+                AlgorithmParameters params = cipher.getParameters();
+
+                byte[] iv = params.getParameterSpec(IvParameterSpec.class).getIV();
+
+                // might be too slow
+                byte[] encrypted = cipher.doFinal(data.getBytes());
+
+                Buffer newData = new Buffer();
+
+                newData.appendInt(iv.length);
+                newData.appendBytes(iv);
+
+                newData.appendInt(encrypted.length);
+                newData.appendBytes(encrypted);
+
+                return newData;
+
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }, event -> resultHandler.handle(event));
+    }
+
+    private void publishEvent(int evtType, Buffer evtData, boolean publishEVAP) {
+
+        Buffer evt = new Buffer();
+        evt.appendInt(evtType);
+
+        String nodeId = cluster.manager().nodeId();
+
+        evt.appendInt(nodeId.length());
+        evt.appendString(nodeId);
+
+        evt.appendBuffer(evtData);
+
+        encryptMessageData(evt, event -> {
+            eventBus.publish("nb.event." + mapHash, event.result());
+
+            if(evapEnabled && publishEVAP){
+
+                // Let's broadcast this message to the peer
+                EVAPPeerService.ready(evapPeerService -> {
+
+                    Buffer dataBroadcast = new Buffer();
+                    dataBroadcast.appendInt(100); // We must keep it 100 at all times.
+
+                    dataBroadcast.appendInt(mapHash.length());
+                    dataBroadcast.appendString(mapHash);
+
+                    Buffer encryptedEvent = event.result();
+
+                    dataBroadcast.appendInt(encryptedEvent.length());
+                    dataBroadcast.appendBuffer(encryptedEvent);
+
+                    // TODO we need to verify this..
+                    for (String evapPeer : replicationPeers) {
+                        evapPeerService.publish(evapPeer, dataBroadcast);
+                    }
+                });
             }
 
-            newData.appendInt(iv.length);
-            newData.appendBytes(iv);
-
-            return newData;
-
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+        });
     }
 
-    private Buffer decryptMessageData(Buffer data) {
+    private void storeIPFSData(String name, byte[] data, boolean save, Handler<AsyncResult<String>> resultHandler) {
+        localAsync.executeBlocking(() -> {
 
-        try {
-            int pos = 0;
-            int ivHashLen = data.getInt(pos);
-            pos += 4;
-            String ivHash = data.getString(pos, ivHashLen + pos);
-            pos += ivHashLen;
-
-            int dataLen = data.getInt(pos);
-            pos += 4;
-
-            // We need to retrieve the iv from Hazelcast.
-            // We can also remove it too.
-            byte[] iv = (byte[]) sharedData.get(ivHash);
-
-            byte[] encrypted = data.getBytes(pos, dataLen + pos);
-
-            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
-            IvParameterSpec ivParameterSpec = new IvParameterSpec(iv);
-            cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec);
-
-            return new Buffer(cipher.doFinal(encrypted));
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private Buffer encryptMessageData(Buffer data) {
-        try {
-            Cipher cipher = Cipher.getInstance(DEFAULT_CIPHER);
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey);
-            AlgorithmParameters params = cipher.getParameters();
-
-            byte[] iv = params.getParameterSpec(IvParameterSpec.class).getIV();
-
-            // might be too slow
-            byte[] encrypted = cipher.doFinal(data.getBytes());
-
-            Buffer newData = new Buffer();
-
-            String ivHash = CryptoUtils.calculateSHA1(iv);
-
-            // We need to store this here
-            sharedData.put(ivHash, iv, 15, TimeUnit.MINUTES);
-
-            newData.appendInt(ivHash.length());
-            newData.appendString(ivHash);
-            newData.appendInt(encrypted.length);
-            newData.appendBytes(encrypted);
-
-            return newData;
-
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private void publishEvent(int evtType, Buffer evtData) {
-
-            localAsync.executeBlocking(() -> {
-
-            Buffer evt = new Buffer();
-            evt.appendInt(evtType);
-
-            String nodeId = cluster.manager().nodeId();
-
-            evt.appendInt(nodeId.length());
-            evt.appendString(nodeId);
-
-            evt.appendBuffer(evtData);
-
-            return encryptMessageData(evt);
-        }, event -> eventBus.publish("nb.event." + mapHash, event.result()));
-    }
-
-    private String storeIPFSData(String name, byte[] data, boolean save) {
-        // Not sure if this is too safe :D
-        NamedStreamable.ByteArrayWrapper encIpfsData = new NamedStreamable.ByteArrayWrapper(name, data);
-        List<MerkleNode> addResult;
-        IPFS ipfs = ipfsClientPool.get();
-        try {
-            addResult = ipfs.add(encIpfsData);
-            if(save){
-                ipfs.pin.add(addResult.get(0).hash);
-            }
-
-            EVAPPeerService.ready(evapPeerService -> {
-                for (String evapPeer : evapPeers) {
-                    evapPeerService.persistData(evapPeer, addResult.get(0).hash, null);
+            // Not sure if this is too safe :D
+            NamedStreamable.ByteArrayWrapper encIpfsData = new NamedStreamable.ByteArrayWrapper(name, data);
+            List<MerkleNode> addResult;
+            IPFS ipfs = ipfsClientPool.get();
+            try {
+                addResult = ipfs.add(encIpfsData);
+                if(save){
+                    ipfs.pin.add(addResult.get(0).hash);
                 }
-            });
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        } finally {
-            ipfsClientPool.release(ipfs);
-        }
 
-        return addResult.get(0).hash.toString();
+                EVAPPeerService.ready(evapPeerService -> {
+                    for (String evapPeer : evapPeers) {
+                        evapPeerService.pin(evapPeer, addResult.get(0).hash);
+                    }
+                });
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            } finally {
+                ipfsClientPool.release(ipfs);
+            }
+
+            return addResult.get(0).hash.toString();
+        }, event -> resultHandler.handle(event));
     }
 
     private void storeLocally(String key, byte[] data) {
@@ -1213,25 +1265,33 @@ public class IPFSCryptoPersistor implements DataPersistor {
             }
         }
 
-        onReady(ignored -> localAsync.executeBlocking(() -> createCryptoBlob(dataBuffer), event -> {
+        onReady(new Handler<Void>() {
+            @Override
+            public void handle(Void event) {
+                createCryptoBlob(dataBuffer, new Handler<AsyncResult<Buffer>>() {
+                    @Override
+                    public void handle(AsyncResult<Buffer> event) {
+                        Buffer cryptoBlob = event.result();
 
-            Buffer cryptoBlob = event.result();
+                        String nKey = key.toString();
 
-            String nKey = key.toString();
+                        Buffer storeEvent = new Buffer();
 
-            Buffer storeEvent = new Buffer();
+                        storeEvent.appendInt(nKey.length());
+                        storeEvent.appendString(nKey);
 
-            storeEvent.appendInt(nKey.length());
-            storeEvent.appendString(nKey);
+                        storeEvent.appendLong(cryptoBlob.length());
 
-            storeEvent.appendLong(cryptoBlob.length());
+                        storeEvent.appendBuffer(cryptoBlob);
 
-            storeEvent.appendBuffer(cryptoBlob);
+                        publishEvent(65, storeEvent, true);
 
-            publishEvent(65, storeEvent);
+                        storeLocally(nKey, cryptoBlob.getBytes());
+                    }
+                });
+            }
+        });
 
-            storeLocally(nKey, cryptoBlob.getBytes());
-        }));
     }
 
     @Override

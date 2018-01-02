@@ -57,7 +57,7 @@ public class AsyncPubSub {
         this.async = async;
 
         // Note: This needs improvement.
-        async.setPeriodic(1500, event -> {
+        async.setPeriodic(750, event -> {
             try {
                 if(topicSuppliers.size() > 0){
                     for (Map.Entry<String, Supplier<Object>> entry : topicSuppliers.entrySet()) {
